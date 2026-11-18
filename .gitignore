@@ -1,0 +1,6 @@
+config.json
+*.log
+__pycache__/
+*.pyc
+session_state.json
+bets_history.csv
