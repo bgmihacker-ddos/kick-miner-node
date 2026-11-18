@@ -1,0 +1,19 @@
+# config.json (included for container runtime)
+
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+.vscode/
+.idea/
+*.DS_Store
+Thumbs.db
+
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+README*.md
