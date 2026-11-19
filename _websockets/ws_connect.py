@@ -1,23 +1,11 @@
+import rnet
 import json
 import asyncio
 import traceback
 import random
 from typing import Dict, Optional, Callable, Awaitable
 from dataclasses import dataclass
-
-try:
-    import rnet
-    from rnet import WebSocket, Message
-    HAS_RNET = True
-except ImportError:
-    try:
-        import websockets
-    except ImportError:
-        websockets = None
-    WebSocket = None
-    Message = None
-    HAS_RNET = False
-
+from rnet import WebSocket, Message
 from loguru import logger
 from localization import t
 
@@ -26,7 +14,7 @@ from localization import t
 class ConnectionState:
     is_connected: bool = False
     reconnect_attempts: int = 0
-    max_reconnect_attempts: int = 3
+    max_reconnect_attempts: int = 5
 
 
 class KickWebSocket:
@@ -68,39 +56,19 @@ class KickWebSocket:
                 max_message_size=4096,
             )
 
-            if HAS_RNET and rnet is not None:
+            # Пробуем с прокси
+            if self.proxy:
+                ws_kwargs["proxy"] = self.proxy
+
+            try:
+                self.ws = await rnet.websocket(**ws_kwargs)
+            except TypeError:
                 if self.proxy:
-                    ws_kwargs["proxy"] = self.proxy
-                    try:
-                        self.ws = await asyncio.wait_for(rnet.websocket(**ws_kwargs), timeout=4.0)
-                    except Exception as proxy_err:
-                        logger.warning(
-                            f"⚠️ Proxy connection failed ({proxy_err}), failing over to direct..."
-                        )
-                        ws_kwargs.pop("proxy", None)
-                        self.ws = await asyncio.wait_for(rnet.websocket(**ws_kwargs), timeout=5.0)
-                else:
-                    self.ws = await asyncio.wait_for(rnet.websocket(**ws_kwargs), timeout=5.0)
-            else:
-                if self.proxy:
-                    try:
-                        from websockets_proxy import Proxy, proxy_connect
-                        proxy_obj = Proxy.from_url(self.proxy)
-                        self.ws = await asyncio.wait_for(
-                            proxy_connect(ws_url, proxy=proxy_obj),
-                            timeout=4.0
-                        )
-                    except Exception as pe:
-                        logger.warning(f"⚠️ Proxy failed ({pe}), falling back to direct...")
-                        self.ws = await asyncio.wait_for(
-                            websockets.connect(ws_url),
-                            timeout=5.0
-                        )
-                else:
-                    self.ws = await asyncio.wait_for(
-                        websockets.connect(ws_url),
-                        timeout=5.0
+                    logger.warning(
+                        "rnet.websocket no longer supports proxy"
                     )
+                ws_kwargs.pop("proxy", None)
+                self.ws = await rnet.websocket(**ws_kwargs)
 
             logger.success(t("websocket_connected"))
             self.state.is_connected = True
@@ -182,10 +150,12 @@ class KickWebSocket:
 
     async def _handle_message(self, message):
         try:
-            if hasattr(message, "text"):
-                msg = message.text
-            elif isinstance(message, bytes):
-                msg = message.decode("utf-8", errors="ignore")
+            if isinstance(message, Message):
+                msg = (
+                    message.text
+                    if hasattr(message, "text")
+                    else str(message)
+                )
             else:
                 msg = str(message)
 
@@ -255,8 +225,11 @@ class KickWebSocket:
             ))
             await self._cleanup_tasks()
 
-            delay = random.uniform(3.0, 7.0)
-            logger.info(f"Reconnect delay: {delay:.1f}s")
+            delay = min(
+                5 * (2 ** (self.state.reconnect_attempts - 1)),
+                120,
+            )
+            logger.info(f"Reconnect delay: {delay}s")
             await asyncio.sleep(delay)
             await self.connect()
         else:
@@ -285,21 +258,6 @@ class KickWebSocket:
                 pass
         logger.info(t("websocket_closed"))
 
-    async def _send_msg(self, payload: dict) -> bool:
-        if not self.state.is_connected or not self.ws:
-            return False
-        raw_json = json.dumps(payload)
-        try:
-            if HAS_RNET and Message is not None:
-                await self.ws.send(Message.from_text(raw_json))
-            else:
-                await self.ws.send(raw_json)
-            return True
-        except Exception as e:
-            logger.error(f"WebSocket send error: {e}")
-            self.state.is_connected = False
-            return False
-
     async def _send_handshake(self):
         if not self.state.is_connected:
             return
@@ -313,22 +271,41 @@ class KickWebSocket:
                 }
             },
         }
-        await self._send_msg(payload)
-        logger.debug(t(
-            "sent_handshake",
-            channel_id=self.data.get("channelId", "?"),
-        ))
+        try:
+            await self.ws.send(
+                Message.from_text(json.dumps(payload))
+            )
+            logger.debug(t(
+                "sent_handshake",
+                channel_id=self.data.get("channelId", "?"),
+            ))
+        except Exception as e:
+            logger.error(t(
+                "failed_send_handshake", error=str(e)
+            ))
+            self.state.is_connected = False
 
     async def _send_ping(self):
         if not self.state.is_connected:
             return
-        await self._send_msg({"type": "ping"})
-        logger.debug(t("sent_ping"))
+        try:
+            await self.ws.send(
+                Message.from_text(json.dumps({"type": "ping"}))
+            )
+            logger.debug(t("sent_ping"))
+        except Exception as e:
+            logger.error(t("failed_send_ping", error=str(e)))
+            self.state.is_connected = False
 
     async def _send_pong(self):
         if not self.state.is_connected:
             return
-        await self._send_msg({"type": "pong"})
+        try:
+            await self.ws.send(
+                Message.from_text(json.dumps({"type": "pong"}))
+            )
+        except Exception:
+            pass
 
     async def _send_user_event(self):
         if not self.state.is_connected:
@@ -347,9 +324,17 @@ class KickWebSocket:
                 }
             },
         }
-        await self._send_msg(payload)
-        logger.debug(t(
-            "sent_user_event",
-            channel_id=self.data.get("channelId", "?"),
-            stream_id=self.data.get("streamId", "?"),
-        ))
+        try:
+            await self.ws.send(
+                Message.from_text(json.dumps(payload))
+            )
+            logger.debug(t(
+                "sent_user_event",
+                channel_id=self.data.get("channelId", "?"),
+                stream_id=self.data.get("streamId", "?"),
+            ))
+        except Exception as e:
+            logger.error(t(
+                "failed_send_user_event", error=str(e)
+            ))
+            self.state.is_connected = False

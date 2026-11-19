@@ -1,0 +1,129 @@
+{
+  "Language": "en",
+  "Debug": false,
+
+  "HealthCheck": {
+    "enabled": true,
+    "interval": 60,
+    "url": ""
+  },
+
+  "WebDashboard": {
+    "enabled": true,
+    "port": 5000
+  },
+
+  "Telegram": {
+    "enabled": false,
+    "bot_token": "YOUR_TELEGRAM_BOT_TOKEN",
+    "chat_id": "YOUR_TELEGRAM_USER_ID",
+    "allowed_users": [123456789]
+  },
+
+  "Discord": {
+    "enabled": false,
+    "webhook_url": "https://discord.com/api/webhooks/XXXX/YYYY",
+    "username": "Baillora KickMiner",
+    "avatar_url": "",
+    "notify_points": true,
+    "notify_status_change": true,
+    "notify_errors": true,
+    "notify_startup": true,
+    "min_points_gain": 10,
+    "color_success": 3461464,
+    "color_info": 5793266,
+    "color_warning": 16763904,
+    "color_error": 15746887
+  },
+  
+  "Proxy": {
+    "enabled": false,
+    "url": "socks5://user:password@host:port"
+  },
+
+  "GitHubSync": {
+    "enabled": true,
+    "token": "",
+    "repo": "bgmihacker-ddos/miner-2",
+    "branch": "main",
+    "interval": 600
+  },
+
+  "Predictions": {
+    "enabled": true,
+    "strategy": "brain",
+    "aggressive_threshold": 15000,
+    "moderate_threshold": 30000,
+    "aggressive_stage1_percentage": 50,
+    "aggressive_stage2_percentage": 35,
+    "aggressive_stage3_percentage": 20,
+    "moderate_stage1_percentage": 25,
+    "moderate_stage2_percentage": 18,
+    "moderate_stage3_percentage": 12,
+    "safe_stage1_percentage": 12,
+    "safe_stage2_percentage": 8,
+    "safe_stage3_percentage": 5,
+    "min_odds_stage1": 1.2,
+    "max_bet_cap": 0,
+    "max_pool_share": 0.25,
+    "seconds_before_lock": 5,
+    "check_interval": 10,
+    "min_bet": 10,
+    "hedging": {
+      "enabled": true
+    },
+    "loss_recovery": {
+      "enabled": true,
+      "mode": "percentage_steps",
+      "multiplier": 2.0,
+      "percentage_steps": [15, 25, 35, 45, 60],
+      "max_streak": 5
+    },
+    "win_streak_compounding": {
+      "enabled": true,
+      "percentage_steps": [15, 25, 35],
+      "max_streak": 3
+    },
+    "kelly_criterion": {
+      "fraction": 0.75
+    },
+    "anti_whale": {
+      "min_voter_consensus": 55.0,
+      "min_odds": 1.35
+    },
+    "min_odds_floor": 1.20,
+    "min_voters_threshold": 8,
+    "prioritize_active_predictions": true,
+    "bootstrap_turbo": {
+      "enabled": true,
+      "threshold": 3000,
+      "percentage": 90
+    },
+    "default_stop_target": 500000,
+    "stop_targets": {
+      "streamer_name": 500000
+    }
+  },
+
+  "Accounts": [
+    {
+      "alias": "Main Account",
+      "token": "YOUR_KICK_TOKEN_1",
+      "proxy": null,
+      "streamers": ["streamer1", "streamer2", "streamer3"],
+      "max_concurrent": 2
+    },
+    {
+      "alias": "Second Account",
+      "token": "YOUR_KICK_TOKEN_2",
+      "proxy": "socks5://user:pass@proxy2:1080",
+      "streamers": ["streamer2", "streamer3", "streamer4"],
+      "max_concurrent": 1
+    }
+  ],
+
+  "Check_interval": 60,
+  "Reconnect_cooldown": 60,
+  "Connection_stagger_min": 3,
+  "Connection_stagger_max": 8
+}

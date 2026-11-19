@@ -400,32 +400,6 @@ class DiscordWebhook:
         payload = self._build_payload([embed])
         self._send_in_thread(payload)
 
-    def send_token_expired(
-        self,
-        account_alias: str,
-        details: str = "",
-    ):
-        """Notification when a Kick account token expires."""
-        if not self.enabled or not self.notify_errors:
-            return
-
-        embed = self._embed(
-            title="🚨 Kick Token Expired",
-            description=(
-                f"Authentication token for **{account_alias}** has expired or was revoked.\n\n"
-                f"**Detail:** {details}\n"
-                f"Points farming and betting are paused for this account until renewed."
-            ),
-            color=self.color_error,
-            fields=[
-                self._field("Account", account_alias),
-                self._field("Action Required", "Renew token from Kick browser session & update config"),
-            ],
-        )
-
-        payload = self._build_payload([embed])
-        self._send_in_thread(payload)
-
     def send_error(
         self,
         account_alias: str,

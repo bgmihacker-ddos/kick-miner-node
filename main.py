@@ -10,6 +10,7 @@ from localization import load_language, t
 
 from account_manager import AccountManager
 from discord_webhook import DiscordWebhook
+import web_server
 import urllib.request
 import ssl
 
@@ -120,44 +121,35 @@ async def main():
     all_streamers = account_manager.get_all_streamers_flat()
     logger.info(f"📋 Total unique streamers: {len(all_streamers)}")
 
-    # 3. Web Dashboard vs. Worker API (START FIRST TO SATISFY RENDER PORT CHECK)
-    web_cfg = config.get("WebDashboard", {})
-    worker_mode = config.get("WorkerMode", False)
-    is_render = bool(os.environ.get("RENDER") or os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("PORT"))
-    web_enabled = web_cfg.get("enabled", True) or is_render
-    port = int(os.environ.get("PORT", config.get("WorkerPort", web_cfg.get("port", 5000))))
-
-    if worker_mode:
-        from worker_api import WorkerAPI, memory_scrubber_task
-        api = WorkerAPI(account_manager, port=port)
-        await api.start()
-        asyncio.create_task(memory_scrubber_task(interval_minutes=15))
-        logger.success(f"🚀 Worker Mode ACTIVE on port {port}")
-    elif web_enabled:
-        try:
-            import web_server
-            web_server.start_server(account_manager, port)
-            logger.info(f"🌍 Web Dashboard: http://0.0.0.0:{port}")
-        except Exception as e:
-            logger.error(f"Web Dashboard failed to start: {e}")
-
-    # 4. Discord Webhook
+    # 3. Discord Webhook
     discord_hook = DiscordWebhook(config)
     if discord_hook.enabled:
         account_manager.set_discord(discord_hook)
         logger.info("🟣 Discord webhook enabled")
 
-    # 5. Telegram (Runs in background so it never blocks Render health check)
+    # 4. Telegram
     if config.get("Telegram", {}).get("enabled", False):
         try:
             from tg_bot.bot import TelegramBot
             telegram_bot = TelegramBot(config)
             telegram_bot.set_account_manager(account_manager)
             account_manager.set_telegram(telegram_bot)
-            asyncio.create_task(telegram_bot.start())
-            logger.success("🤖 Telegram Bot: Starting in background...")
+            await telegram_bot.start()
         except Exception as e:
             logger.error(f"Telegram bot failed to start: {e}")
+
+    # 5. Web Dashboard
+    web_cfg = config.get("WebDashboard", {})
+    is_render = bool(os.environ.get("RENDER") or os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("PORT"))
+    web_enabled = web_cfg.get("enabled", True) or is_render
+    port = int(os.environ.get("PORT", web_cfg.get("port", 5000)))
+
+    if web_enabled:
+        try:
+            web_server.start_server(account_manager, port)
+            logger.info(f"🌍 Web Dashboard: http://0.0.0.0:{port}")
+        except Exception as e:
+            logger.error(f"Web Dashboard failed to start: {e}")
 
     # 6. Render Keep-Alive / Healthcheck query task (every 60 sec)
     health_cfg = config.get("HealthCheck", {})

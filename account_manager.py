@@ -6,7 +6,7 @@ import random
 import time
 import urllib.parse
 from datetime import datetime, timezone, timedelta
-from typing import Dict, List, Optional, Tuple, Any, TYPE_CHECKING
+from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 from dataclasses import dataclass, field
 from loguru import logger
 
@@ -15,7 +15,6 @@ from _websockets.ws_connect import KickWebSocket
 from utils.kick_utility import KickUtility
 from utils.get_points_amount import PointsAmount
 from utils.kick_prediction import KickPrediction
-from utils.kick_rewards import KickRewards
 
 if TYPE_CHECKING:
     from discord_webhook import DiscordWebhook
@@ -174,7 +173,6 @@ class AccountState:
     max_concurrent: int
     streamers: Dict[str, StreamerState] = field(default_factory=dict)
     streamer_order: List[str] = field(default_factory=list)
-    daily_streak: int = 0
 
     @property
     def active_count(self) -> int:
@@ -210,9 +208,6 @@ class AccountWorker:
         self.stagger_min = stagger_min
         self.stagger_max = stagger_max
         self.manager = manager
-        self.token_valid = True
-        self.last_token_check = 0.0
-        self._token_expired_notified = False
 
         pred_cfg = account_cfg.get("predictions") or prediction_cfg or {}
         self.predictions_enabled = pred_cfg.get("enabled", True)
@@ -316,8 +311,6 @@ class AccountWorker:
         self._utility_cache: Dict[str, KickUtility] = {}
         self._points_checker: Optional[PointsAmount] = None
         self._ws_token_getter: Optional[KickPoints] = None
-        self.rewards_client = KickRewards(token=self.token, proxy=self.proxy, alias=self.alias)
-        self._rewards_task: Optional[asyncio.Task] = None
         self._discord: Optional["DiscordWebhook"] = None
         self._telegram = None
 
@@ -385,9 +378,8 @@ class AccountWorker:
 
     def _get_utility(self, streamer: str) -> KickUtility:
         if streamer not in self._utility_cache:
-            # Public streamer online status is checked directly to save 90% proxy data
             self._utility_cache[streamer] = KickUtility(
-                streamer, proxy=None
+                streamer, proxy=self.proxy
             )
         return self._utility_cache[streamer]
 
@@ -408,74 +400,6 @@ class AccountWorker:
             self._prediction_client = KickPrediction(proxy=self.proxy)
         return self._prediction_client
 
-    async def _rewards_loop(self):
-        """Periodically checks and auto-claims Kick Daily Streak rewards & crates."""
-        # Initial stagger by worker_index to prevent burst traffic
-        await asyncio.sleep(self.worker_index * 3 + random.uniform(2.0, 5.0))
-        while self._running:
-            try:
-                loop = asyncio.get_running_loop()
-                claimed_list = await loop.run_in_executor(
-                    None, self.rewards_client.check_and_claim_rewards
-                )
-                self.state.daily_streak = self.rewards_client.streak_days
-
-                if claimed_list:
-                    for reward in claimed_list:
-                        r_name = reward.get("name", "Daily Reward")
-                        r_rarity = reward.get("rarity", "common")
-                        r_streak = reward.get("streak", self.state.daily_streak)
-                        msg = (
-                            f"🎁 [{self.alias}] Auto-claimed {r_name}! "
-                            f"Rarity: {r_rarity.upper()} | Streak: {r_streak} days 🔥"
-                        )
-                        logger.success(msg)
-                        if self._discord:
-                            try:
-                                self._discord.send_custom(
-                                    title="🎁 Kick Daily Reward Claimed!",
-                                    description=(
-                                        f"**Account:** `{self.alias}`\n"
-                                        f"**Reward:** {r_name}\n"
-                                        f"**Rarity:** `{r_rarity.upper()}`\n"
-                                        f"**Streak:** {r_streak} days 🔥"
-                                    ),
-                                    color=0x53FC18
-                                )
-                            except Exception:
-                                pass
-                        if self._telegram and hasattr(self._telegram, "send_streamer_warning"):
-                            try:
-                                asyncio.create_task(
-                                    self._telegram.send_streamer_warning(
-                                        self.alias,
-                                        "Daily Rewards",
-                                        f"Auto-claimed {r_name} ({r_rarity.upper()})! Streak: {r_streak} days 🔥"
-                                    )
-                                )
-                            except Exception:
-                                pass
-                else:
-                    logger.debug(
-                        f"[{self.alias}] Daily reward check complete. Current streak: {self.state.daily_streak} days."
-                    )
-            except Exception as e:
-                logger.debug(f"[{self.alias}] Error in daily rewards loop: {e}")
-
-            # If 60m watch-time challenge is currently in progress, check frequently (every 15 min).
-            # Once claimed for today, check every 1-2 hours until next daily reset.
-            if getattr(self.rewards_client, "has_pending_challenge", False):
-                sleep_secs = 900 + random.uniform(15.0, 60.0)
-            else:
-                sleep_secs = 3600 + random.uniform(60.0, 180.0)
-            await asyncio.sleep(sleep_secs)
-
-    def claim_daily_rewards_now(self) -> List[dict]:
-        """Manually triggers an immediate check and claim for this account."""
-        claimed = self.rewards_client.check_and_claim_rewards()
-        self.state.daily_streak = self.rewards_client.streak_days
-        return claimed
-
     async def start(self):
         self._running = True
         logger.info(
@@ -486,14 +410,8 @@ class AccountWorker:
         )
 
         try:
-            self._rewards_task = asyncio.create_task(self._rewards_loop())
             await self._check_all_online()
-            for name, st in self.state.streamers.items():
-                if st.is_online and not st.is_watching:
-                    try:
-                        await self._start_streamer(name)
-                    except Exception as e:
-                        logger.warning(f"[{self.alias}] Initial start for {name} deferred: {e}")
+            await self._rebalance()
 
             while self._running:
                 jitter = random.uniform(
@@ -502,17 +420,7 @@ class AccountWorker:
                 )
                 await asyncio.sleep(jitter)
                 await self._check_all_online()
-                for name, st in self.state.streamers.items():
-                    if st.is_online and not st.is_watching:
-                        try:
-                            await self._start_streamer(name)
-                        except Exception as e:
-                            logger.warning(f"[{self.alias}] Watch loop start for {name} error: {e}")
-                    elif not st.is_online and st.is_watching:
-                        try:
-                            await self._stop_streamer(name)
-                        except Exception as e:
-                            logger.warning(f"[{self.alias}] Watch loop stop for {name} error: {e}")
+                await self._rebalance()
 
         except asyncio.CancelledError:
             logger.info(f"[{self.alias}] Worker cancelled")
@@ -529,9 +437,6 @@ class AccountWorker:
             if not self._running:
                 break
             try:
-                st = self.state.streamers[name]
-                was_online = st.is_online
-
                 stream_id = None
                 from_cache = False
                 if self.manager:
@@ -542,20 +447,12 @@ class AccountWorker:
 
                 if not from_cache:
                     utility = self._get_utility(name)
-                    stream_id = await asyncio.to_thread(utility.get_stream_id, self.token)
-                    if stream_id is None and was_online and st.is_watching:
-                        st.offline_retry_count = getattr(st, 'offline_retry_count', 0) + 1
-                        if st.offline_retry_count < 2:
-                            stream_id = st.stream_id
-                        else:
-                            st.offline_retry_count = 0
-                            if self.manager:
-                                self.manager.set_cached_stream_id(name, None)
-                    else:
-                        st.offline_retry_count = 0
-                        if self.manager:
-                            self.manager.set_cached_stream_id(name, stream_id)
+                    stream_id = utility.get_stream_id(self.token)
+                    if self.manager:
+                        self.manager.set_cached_stream_id(name, stream_id)
 
+                st = self.state.streamers[name]
+                was_online = st.is_online
                 st.is_online = stream_id is not None
                 st.stream_id = stream_id
 
@@ -592,8 +489,6 @@ class AccountWorker:
                                 self.alias, name, st.priority, "online"
                             )
                         )
-                    if not st.is_watching:
-                        await self._start_streamer(name)
 
                 elif was_online and not st.is_online:
                     logger.info(
@@ -623,8 +518,6 @@ class AccountWorker:
                         asyncio.create_task(
                             self.manager.on_stream_ended(name, self.alias)
                         )
-                    if st.is_watching:
-                        await self._stop_streamer(name)
 
                 elif not st.is_online:
                     logger.debug(
@@ -655,26 +548,112 @@ class AccountWorker:
             )
 
     async def _rebalance(self):
-        """Direct watcher check (complex rebalance and displacement removed)."""
         async with self._rebalance_lock:
             try:
-                for name, st in self.state.streamers.items():
-                    if st.is_online and not st.is_watching:
-                        await self._start_streamer(name)
-                    elif not st.is_online and st.is_watching:
-                        await self._stop_streamer(name)
+                online_by_priority = [
+                    name
+                    for name in self.state.streamer_order
+                    if self.state.streamers[name].is_online
+                ]
+                logger.info(f"[{self.alias}] 🔄 _rebalance: online streamers = {online_by_priority}")
+
+                if self.prioritize_active_predictions:
+                    try:
+                        from utils.adaptive_learning import AdaptiveLearningEngine
+                        engine = AdaptiveLearningEngine()
+                        def _rank_streamer(n):
+                            st_obj = self.state.streamers[n]
+                            prof = engine.get_streamer_profile(n)
+                            freq = prof.get("total_bets", 0) + st_obj.total_predictions_seen
+                            return (
+                                not getattr(st_obj, "goal_completed", False),
+                                freq > 0,
+                                freq,
+                                -st_obj.priority,
+                            )
+                        online_by_priority.sort(key=_rank_streamer, reverse=True)
+                    except Exception as e_sort:
+                        logger.warning(f"[{self.alias}] Streamer ranking warning: {e_sort}")
+
+                desired = set(
+                    online_by_priority[: self.max_concurrent]
+                )
+                current = {
+                    name
+                    for name, s in self.state.streamers.items()
+                    if s.is_watching
+                }
+                logger.info(f"[{self.alias}] 🔄 _rebalance: desired={desired}, current={current}")
+
+                to_stop = current - desired
+                for name in to_stop:
+                    reason = (
+                        "offline"
+                        if not self.state.streamers[name].is_online
+                        else "displaced by higher priority"
+                    )
+                    logger.info(
+                        f"[{self.alias}] ⏹ {name} — {reason}"
+                    )
+                    await self._stop_streamer(name)
+
+                    if (
+                        self._discord
+                        and reason == "displaced by higher priority"
+                    ):
+                        self._discord.send_streamer_online(
+                            self.alias, name,
+                            self.state.streamers[name].priority,
+                            "displaced"
+                        )
+
+                    if self._telegram:
+                        asyncio.create_task(
+                            self._telegram.send_streamer_stopped(
+                                self.alias, name, reason
+                            )
+                        )
+
+                to_start = desired - current
+                if to_start:
+                    logger.info(f"[{self.alias}] 🚀 Starting {len(to_start)} streamers: {to_start}")
+                for name in to_start:
+                    pri = self.state.streamers[name].priority
+                    logger.info(
+                        f"[{self.alias}] ▶ Starting watcher for {name} (priority={pri})"
+                    )
+                    await self._start_streamer(name)
+
+                    if self._discord:
+                        self._discord.send_streamer_online(
+                            self.alias, name, pri, "started"
+                        )
+
+                    if self._telegram:
+                        asyncio.create_task(
+                            self._telegram.send_streamer_started(
+                                self.alias, name, pri
+                            )
+                        )
+
+                    await asyncio.sleep(
+                        random.uniform(
+                            self.stagger_min, self.stagger_max
+                        )
+                    )
+
+                if desired:
+                    logger.info(
+                        f"[{self.alias}] Active: "
+                        f"{sorted(desired)} "
+                        f"({len(desired)}/{self.max_concurrent})"
+                    )
             except Exception as e:
-                logger.error(f"[{self.alias}] Error in watcher check: {e}")
+                logger.error(f"[{self.alias}] ❌ _rebalance exception: {e}")
 
 
     async def _start_streamer(self, name: str):
         st = self.state.streamers[name]
-
-        # Guard: do not attempt to start if streamer is offline
-        if not st.is_online or not st.stream_id:
-            logger.info(f"[{self.alias}] Streamer {name} is offline. Skipping start.")
-            st.is_watching = False
-            return
 
         # Clean up any lingering tasks for this streamer to prevent duplicate loops
         for task in (st.ws_task, st.points_task, st.prediction_task):
@@ -686,13 +665,10 @@ class AccountWorker:
 
         try:
             if not st.channel_id:
-                if self.manager and hasattr(self.manager, "channel_id_cache") and name in self.manager.channel_id_cache:
-                    st.channel_id = self.manager.channel_id_cache[name]
-                else:
-                    utility = self._get_utility(name)
-                    st.channel_id = await asyncio.to_thread(utility.get_channel_id, self.token)
-                    if st.channel_id and self.manager and hasattr(self.manager, "channel_id_cache"):
-                        self.manager.channel_id_cache[name] = st.channel_id
+                utility = self._get_utility(name)
+                st.channel_id = utility.get_channel_id(
+                    self.token
+                )
                 if not st.channel_id:
                     raise RuntimeError(
                         f"Could not get channel_id for {name}"
@@ -700,26 +676,11 @@ class AccountWorker:
 
             ws_token_getter = self._get_ws_token_getter()
             ws_token = None
-            sem = getattr(self.manager, "token_semaphore", None) if self.manager else None
             for attempt in range(1, 4):
-                if sem:
-                    async with sem:
-                        ws_token = await asyncio.to_thread(ws_token_getter.get_ws_token, name)
-                else:
-                    ws_token = await asyncio.to_thread(ws_token_getter.get_ws_token, name)
+                ws_token = ws_token_getter.get_ws_token(name)
                 if ws_token:
                     break
                 if attempt < 3:
-                    # Check if streamer is still live before sleeping and retrying
-                    utility = self._get_utility(name)
-                    check_sid = await asyncio.to_thread(utility.get_stream_id, self.token)
-                    if not check_sid:
-                        logger.info(f"[{self.alias}] Streamer {name} is offline. Aborting WS token retry.")
-                        st.is_online = False
-                        st.stream_id = None
-                        if self.manager:
-                            self.manager.set_cached_stream_id(name, None)
-                        return
                     backoff = attempt * 2 + random.uniform(0.5, 1.5)
                     logger.warning(
                         f"[{self.alias}] WS token retry {attempt}/3 for {name} in {backoff:.1f}s..."
@@ -727,11 +688,6 @@ class AccountWorker:
                     await asyncio.sleep(backoff)
 
             if not ws_token:
-                st.is_online = False
-                st.stream_id = None
-                if self.manager:
-                    self.manager.set_cached_stream_id(name, None)
-                    asyncio.create_task(self.manager.check_worker_token(self))
                 raise RuntimeError(
                     f"Could not get WS token for {name}"
                 )
@@ -873,26 +829,9 @@ class AccountWorker:
             st.points_task = None
             st.prediction_task = None
 
-            if self._running:
-                # Re-verify if streamer is still live before scheduling reconnect
-                utility = self._get_utility(name)
-                current_live_id = await asyncio.to_thread(utility.get_stream_id, self.token)
-                if not current_live_id:
-                    logger.info(f"[{self.alias}] 🔴 Streamer {name} is offline. No reconnect scheduled.")
-                    st.is_online = False
-                    st.stream_id = None
-                    if self.manager:
-                        self.manager.set_cached_stream_id(name, None)
-                elif st.is_online:
-                    logger.info(f"[{self.alias}] 🔄 Streamer {name} disconnected but stream is live. Scheduling reconnect in 15s...")
-                    asyncio.create_task(self._delayed_reconnect(name, 15))
-
-    async def _delayed_reconnect(self, name: str, delay: float = 15):
-        await asyncio.sleep(delay)
-        if self._running:
-            st = self.state.streamers.get(name)
-            if st and st.is_online and not st.is_watching:
-                await self._start_streamer(name)
+            if self._running and st.is_online:
+                logger.info(f"[{self.alias}] 🔄 Streamer {name} disconnected. Scheduling reconnect in 15s...")
+                asyncio.create_task(self._delayed_rebalance(15))
 
     async def _delayed_rebalance(self, delay: float = 15):
         await asyncio.sleep(delay)
@@ -973,7 +912,7 @@ class AccountWorker:
                 pred = pred_data.get("prediction")
                 if not pred or not isinstance(pred, dict):
                     st.active_prediction = None
-                    await asyncio.sleep(15)  # Idle: save 75% prediction proxy data
+                    await asyncio.sleep(poll_interval)
                     continue
 
                 pred_state = pred.get("state")
@@ -1675,15 +1614,9 @@ class AccountWorker:
     async def stop(self):
         self._running = False
 
-        if self._rewards_task and not self._rewards_task.done():
-            self._rewards_task.cancel()
-
         for name in list(self.state.streamers):
             if self.state.streamers[name].is_watching:
                 await self._stop_streamer(name)
-
-        if self.rewards_client:
-            self.rewards_client.close()
 
         if self._points_checker:
             self._points_checker.close()
@@ -1782,11 +1715,8 @@ class AccountWorker:
     def get_status(self) -> dict:
         return {
             "alias": self.alias,
-            "token_valid": getattr(self, "token_valid", True),
-            "last_token_check": getattr(self, "last_token_check", 0.0),
             "proxy": bool(self.proxy),
             "max_concurrent": self.max_concurrent,
-            "daily_streak": getattr(self.state, "daily_streak", 0),
             "active_count": self.state.active_count,
             "active_streamers": self.state.active_names,
             "streamer_order": self.state.streamer_order,
@@ -1841,18 +1771,6 @@ class AccountManager:
         self.stagger_min = config.get("Connection_stagger_min", 3)
         self.stagger_max = config.get("Connection_stagger_max", 8)
         self.prediction_cfg = config.get("Predictions", {})
-        self.token_check_interval = int(config.get("Token_check_interval", 300))
-        self.proxy_pool = config.get("Proxy_Pool", [])
-        self.channel_id_cache = {}
-        self.token_semaphore = asyncio.Semaphore(4)
-
-        autochat_cfg = config.get("AutoChat", {})
-        try:
-            from utils.auto_commenter import AutoCommenter
-            self.auto_commenter = AutoCommenter(self, autochat_cfg)
-        except Exception as e_ac:
-            logger.warning(f"⚠️ AutoCommenter init warning: {e_ac}")
-            self.auto_commenter = None
 
         # Common streamers list
         common_streamers = config.get("Streamers", [])
@@ -1932,7 +1850,7 @@ class AccountManager:
             f"{len(self.workers)} accounts"
         )
 
-    def get_cached_stream_id(self, streamer: str, ttl: float = 300.0) -> Tuple[bool, Optional[int]]:
+    def get_cached_stream_id(self, streamer: str, ttl: float = 45.0) -> Tuple[bool, Optional[int]]:
         """Return (True, stream_id) if cached within ttl seconds, else (False, None)."""
         entry = self._live_stream_cache.get(streamer.lower())
         if entry:
@@ -1942,12 +1860,7 @@ class AccountManager:
         return False, None
 
     def set_cached_stream_id(self, streamer: str, stream_id: Optional[int]):
-        """Update live stream_id cache for a streamer with graceful failover protection."""
-        if stream_id is None:
-            entry = self._live_stream_cache.get(streamer.lower())
-            if entry and entry[0] is not None:
-                if time.time() - entry[1] < 180.0:
-                    return
+        """Update live stream_id cache for a streamer."""
         self._live_stream_cache[streamer.lower()] = (stream_id, time.time())
 
     async def on_stream_ended(self, streamer: str, account_alias: str):
@@ -2036,22 +1949,17 @@ class AccountManager:
 
     async def start_all(self):
         self._is_stopped = False
-
-        # Pre-seed permanent channel IDs for known streamers
-        for streamer in self.common_streamers:
-            if streamer == "xyroplayzz":
-                self.channel_id_cache["xyroplayzz"] = 110208666
-
-        logger.info(f"🚀 Instantly launching all {len(self.workers)} accounts concurrently (stream join timer REMOVED)...")
         for i, worker in enumerate(self.workers):
+            if i > 0:
+                delay = random.uniform(5, 15)
+                logger.info(
+                    f"⏳ Delay {delay:.0f}s before "
+                    f"account [{worker.alias}]"
+                )
+                await asyncio.sleep(delay)
+
             task = asyncio.create_task(worker.start())
             self._tasks.append(task)
-            await asyncio.sleep(0.02)
-
-        self._tasks.append(asyncio.create_task(self._token_monitor_loop()))
-
-        if getattr(self, "auto_commenter", None) and self.auto_commenter.enabled:
-            self.auto_commenter.start()
 
         if not self.workers:
             logger.warning(
@@ -2068,8 +1976,6 @@ class AccountManager:
 
     async def stop_all(self):
         self._is_stopped = True
-        if getattr(self, "auto_commenter", None):
-            await self.auto_commenter.stop()
         for task in self._tasks:
             task.cancel()
         for w in self.workers:
@@ -2077,22 +1983,6 @@ class AccountManager:
 
     def get_all_status(self) -> List[dict]:
         return [w.get_status() for w in self.workers]
-
-    def claim_all_daily_rewards_now(self) -> Dict[str, Any]:
-        """Manually triggers an immediate claim across all workers."""
-        results = {}
-        for worker in self.workers:
-            try:
-                claimed = worker.claim_daily_rewards_now()
-                results[worker.alias] = {
-                    "claimed": claimed,
-                    "streak": worker.state.daily_streak,
-                    "watch_progress": getattr(worker.rewards_client, "watch_progress", 0),
-                    "watch_threshold": getattr(worker.rewards_client, "watch_threshold", 60),
-                }
-            except Exception as e:
-                results[worker.alias] = {"error": str(e)}
-        return results
 
     def get_total_points(self) -> int:
         total = 0
@@ -2209,46 +2099,25 @@ class AccountManager:
         return summary
 
     @staticmethod
-    def _validate_kick_token(token: str, streamer: str = "binks69", proxy: Optional[str] = None) -> tuple[bool, str]:
-        """Automatic multi-layer token checker that validates token against Kick API."""
+    def _validate_kick_token(token: str, streamer: str = "binks69") -> tuple[bool, str]:
+        """Automatic token checker that validates token against Kick API."""
         try:
             token = clean_token(token)
             if not token:
                 return False, "Token is empty."
 
             from curl_cffi import requests
-            proxies = {"http": proxy, "https": proxy} if proxy else None
-            s = requests.Session(impersonate="chrome120", proxies=proxies)
+            s = requests.Session(impersonate="chrome120")
             headers = {
                 "Authorization": f"Bearer {token}",
                 "Accept": "application/json, text/plain, */*",
                 "Origin": "https://kick.com",
-                "Referer": "https://kick.com/",
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                ),
+                "Referer": f"https://kick.com/{streamer}/",
             }
-
-            # Stage 1: Check user profile
-            try:
-                user_resp = s.get("https://kick.com/api/v1/user", headers=headers, timeout=10)
-                if user_resp.status_code == 200:
-                    data = user_resp.json()
-                    if data.get("id"):
-                        return True, f"OK ({data.get('username')})"
-                elif user_resp.status_code == 401:
-                    return False, "401 Unauthenticated (Invalid or expired Kick token)."
-            except Exception:
-                pass
-
-            # Stage 2: Check points endpoint
-            headers["Referer"] = f"https://kick.com/{streamer}/"
             resp = s.get(
                 f"https://kick.com/api/v2/channels/{streamer}/points",
                 headers=headers,
-                timeout=12,
+                timeout=15,
             )
             if resp.status_code == 200:
                 return True, "OK"
@@ -2260,115 +2129,7 @@ class AccountManager:
             return True, f"HTTP {resp.status_code}"
         except Exception as e:
             logger.warning(f"Kick token verification error: {e}")
-            return True, f"Check skipped ({e})"
-
-    async def _token_monitor_loop(self):
-        """Background loop that periodically re-checks every account's Kick token."""
-        logger.info(
-            f"🔑 Periodic Token Monitor active: auto-checking all accounts every {self.token_check_interval}s"
-        )
-        await asyncio.sleep(15)
-        while not self._is_stopped:
-            try:
-                await self.check_all_tokens()
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.warning(f"⚠️ Periodic token check error: {e}")
-
-            try:
-                await asyncio.sleep(self.token_check_interval)
-            except asyncio.CancelledError:
-                break
-
-    async def check_all_tokens(self) -> dict:
-        """Checks tokens for all workers and dispatches alerts on expiration."""
-        results = {}
-        streamer = self.common_streamers[0] if self.common_streamers else "binks69"
-        for worker in list(self.workers):
-            valid, msg = await asyncio.to_thread(
-                self._validate_kick_token,
-                worker.token,
-                streamer,
-                worker.proxy
-            )
-            worker.token_valid = valid
-            worker.last_token_check = time.time()
-            results[worker.alias] = {"valid": valid, "message": msg}
-
-            if not valid:
-                logger.error(f"[{worker.alias}] 🚨 Kick token has EXPIRED or is INVALID ({msg})")
-                if not worker._token_expired_notified:
-                    worker._token_expired_notified = True
-                    if self._telegram:
-                        asyncio.create_task(
-                            self._telegram.send_token_expired(worker.alias, msg)
-                        )
-                    if self._discord:
-                        self._discord.send_token_expired(worker.alias, msg)
-            else:
-                if worker._token_expired_notified:
-                    logger.success(f"[{worker.alias}] ✅ Kick token is back to VALID!")
-                    worker._token_expired_notified = False
-                    if self._telegram:
-                        asyncio.create_task(
-                            self._telegram.send_streamer_warning(
-                                worker.alias, "Auth", "Kick token is now valid and working again!"
-                            )
-                        )
-        return results
-
-    async def check_worker_token(self, worker: AccountWorker) -> bool:
-        """On-demand check for a specific worker when connection fails."""
-        streamer = self.common_streamers[0] if self.common_streamers else "binks69"
-        valid, msg = await asyncio.to_thread(
-            self._validate_kick_token,
-            worker.token,
-            streamer,
-            worker.proxy
-        )
-        worker.token_valid = valid
-        worker.last_token_check = time.time()
-        if not valid and not worker._token_expired_notified:
-            worker._token_expired_notified = True
-            logger.error(f"[{worker.alias}] 🚨 Kick token is EXPIRED ({msg})")
-            if self._telegram:
-                asyncio.create_task(
-                    self._telegram.send_token_expired(worker.alias, msg)
-                )
-            if self._discord:
-                self._discord.send_token_expired(worker.alias, msg)
-        return valid
-
-    def _update_account_token_in_config(self, alias: str, new_token: str):
-        """Persists updated account token to config.json and CONFIG_JSON env."""
-        try:
-            config_path = "config.json"
-            if os.path.exists(config_path):
-                with open(config_path, "r", encoding="utf-8") as f:
-                    cfg_data = json.load(f)
-                updated = False
-                for acc in cfg_data.get("Accounts", []):
-                    if acc.get("alias", "").strip().lower() == alias.strip().lower():
-                        acc["token"] = new_token
-                        updated = True
-                        break
-                if updated:
-                    with open(config_path, "w", encoding="utf-8") as f:
-                        json.dump(cfg_data, f, indent=2, ensure_ascii=False)
-                    logger.info(f"💾 Updated token for account [{alias}] in config.json")
-            if os.environ.get("CONFIG_JSON"):
-                try:
-                    cfg_env = json.loads(os.environ["CONFIG_JSON"])
-                    for acc in cfg_env.get("Accounts", []):
-                        if acc.get("alias", "").strip().lower() == alias.strip().lower():
-                            acc["token"] = new_token
-                            break
-                    os.environ["CONFIG_JSON"] = json.dumps(cfg_env)
-                except Exception:
-                    pass
-        except Exception as e:
-            logger.error(f"Failed to persist token update for [{alias}]: {e}")
+            return True, "Check skipped due to network error"
 
     @staticmethod
     def _validate_streamer_exists(streamer: str) -> tuple[bool, str]:
@@ -2524,27 +2285,9 @@ class AccountManager:
         if not clean_alias or not clean_token_str:
             return False, "Alias and Token cannot be empty."
 
-        if not proxy and getattr(self, "proxy_pool", None):
-            used_proxies = {w.proxy for w in self.workers if w.proxy}
-            for p in self.proxy_pool:
-                if p not in used_proxies:
-                    proxy = p
-                    break
-
         for w in self.workers:
             if w.alias.strip().lower() == clean_alias.lower():
-                test_ch = self.common_streamers[0] if self.common_streamers else "binks69"
-                valid, val_msg = await asyncio.to_thread(self._validate_kick_token, clean_token_str, test_ch, proxy or w.proxy)
-                if not valid:
-                    return False, val_msg
-                w.token = clean_token_str
-                w.token_valid = True
-                w._token_expired_notified = False
-                w._ws_token_getter = None
-                w._points_checker = None
-                self._update_account_token_in_config(w.alias, clean_token_str)
-                asyncio.create_task(w._rebalance())
-                return True, f"Token updated for existing account '{clean_alias}' and miner reconnected!"
+                return False, f"Account with alias '{clean_alias}' already exists."
 
         # Fetch streamers from common list if not explicitly provided
         target_streamers = list(streamers) if streamers else list(self.common_streamers)

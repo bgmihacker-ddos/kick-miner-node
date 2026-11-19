@@ -45,14 +45,22 @@ class PointsAmount:
     def _ensure_session(self):
         if self._initialized:
             return
-        for name, value in {
-            "showMatureContent": "true",
-            "USER_LOCALE": "en",
-        }.items():
-            self.session.cookies.set(
-                name, value, domain="kick.com"
-            )
-        self._initialized = True
+        try:
+            resp = self.session.get("https://kick.com", timeout=15)
+            if resp.status_code == 200:
+                logger.debug("PointsAmount session OK")
+
+            for name, value in {
+                "showMatureContent": "true",
+                "USER_LOCALE": "en",
+            }.items():
+                self.session.cookies.set(
+                    name, value, domain="kick.com"
+                )
+            time.sleep(random.uniform(0.3, 1.0))
+            self._initialized = True
+        except Exception as e:
+            logger.error(f"PointsAmount init error: {e}")
 
     def close(self):
         try:

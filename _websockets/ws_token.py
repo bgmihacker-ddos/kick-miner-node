@@ -142,15 +142,11 @@ class KickPoints:
                 "Accept": "application/json, text/plain, */*",
             }
 
-            try:
-                channel_response = self.session.get(
-                    f"https://kick.com/api/v2/channels/{streamer_name}",
-                    headers=channel_headers,
-                    timeout=15,
-                )
-            except Exception as e:
-                logger.warning(f"Error fetching channel data for {streamer_name}: {e}")
-                return None
+            channel_response = self.session.get(
+                f"https://kick.com/api/v2/channels/{streamer_name}",
+                headers=channel_headers,
+                timeout=15,
+            )
 
             status = channel_response.status_code
             logger.debug(t("channel_api_status", status=status))
@@ -228,25 +224,16 @@ class KickPoints:
                 "X-User-Id": str(user_id),
             }
 
-            try:
-                ws_response = self.session.get(
-                    "https://websockets.kick.com/viewer/v1/token",
-                    headers=ws_headers,
-                    timeout=15,
-                )
-            except Exception as e:
-                logger.warning(f"Error fetching WS token for {streamer_name}: {e}")
-                return None
+            ws_response = self.session.get(
+                "https://websockets.kick.com/viewer/v1/token",
+                headers=ws_headers,
+                timeout=15,
+            )
 
             ws_status = ws_response.status_code
             logger.debug(t(
                 "websocket_token_api_status", status=ws_status
             ))
-
-            # Fast return on 404 (streamer is offline)
-            if ws_status == 404:
-                logger.info(f"Streamer {streamer_name} is offline (WS token returned 404)")
-                return None
 
             # Retry on non-200 with session reinitialization
             if ws_status != 200:
