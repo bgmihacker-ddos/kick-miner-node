@@ -51,9 +51,9 @@ class KickWebSocket:
 
             ws_kwargs = dict(
                 url=ws_url,
-                read_buffer_size=4096,
-                write_buffer_size=4096,
-                max_message_size=4096,
+                read_buffer_size=65536,
+                write_buffer_size=65536,
+                max_message_size=1048576,
             )
 
             # Пробуем с прокси
@@ -110,14 +110,11 @@ class KickWebSocket:
             try:
                 await asyncio.sleep(random.uniform(25, 35))
                 if self.state.is_connected:
-                    await self._send_handshake()
                     await self._send_ping()
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(t(
-                    "handshake_loop_error", error=str(e)
-                ))
+                logger.debug(f"Ping keepalive notice: {e}")
                 break
 
     async def _tracking_loop(self):
