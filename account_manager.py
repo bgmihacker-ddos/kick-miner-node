@@ -4,6 +4,7 @@ import csv
 import json
 import random
 import time
+import html
 import urllib.parse
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
@@ -15,6 +16,7 @@ from _websockets.ws_connect import KickWebSocket
 from utils.kick_utility import KickUtility
 from utils.get_points_amount import PointsAmount
 from utils.kick_prediction import KickPrediction
+from utils.auto_redeem import KickAutoRedeem
 
 if TYPE_CHECKING:
     from discord_webhook import DiscordWebhook
@@ -311,6 +313,8 @@ class AccountWorker:
         self._utility_cache: Dict[str, KickUtility] = {}
         self._points_checker: Optional[PointsAmount] = None
         self._ws_token_getter: Optional[KickPoints] = None
+        auto_redeem_cfg = account_cfg.get("auto_redeem") or (manager.auto_redeem_cfg if manager else {}) or {}
+        self.auto_redeem = KickAutoRedeem(auto_redeem_cfg)
         self._discord: Optional["DiscordWebhook"] = None
         self._telegram = None
 
@@ -453,8 +457,14 @@ class AccountWorker:
 
                 st = self.state.streamers[name]
                 was_online = st.is_online
-                st.is_online = stream_id is not None
-                st.stream_id = stream_id
+                if stream_id is not None:
+                    st.is_online = True
+                    st.stream_id = stream_id
+                elif st.is_watching and getattr(st, "ws_client", None) and getattr(st.ws_client, "state", None) and st.ws_client.state.is_connected:
+                    st.is_online = True
+                else:
+                    st.is_online = False
+                    st.stream_id = None
 
                 if st.is_online:
                     live_streamers.append(f"{name} (ID: {stream_id})")
@@ -829,9 +839,9 @@ class AccountWorker:
             st.points_task = None
             st.prediction_task = None
 
-            if self._running and st.is_online:
-                logger.info(f"[{self.alias}] 🔄 Streamer {name} disconnected. Scheduling reconnect in 15s...")
-                asyncio.create_task(self._delayed_rebalance(15))
+            if self._running:
+                logger.info(f"[{self.alias}] 🔄 Streamer {name} session dropped. Scheduling reconnect in 8s...")
+                asyncio.create_task(self._delayed_rebalance(8))
 
     async def _delayed_rebalance(self, delay: float = 15):
         await asyncio.sleep(delay)
@@ -883,12 +893,50 @@ class AccountWorker:
                             )
                         )
 
+                    if getattr(self, "auto_redeem", None) and self.auto_redeem.enabled:
+                        await self._auto_redeem_check(name, amount)
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(
                     f"[{self.alias}] Points error for {name}: {e}"
                 )
+
+    async def _auto_redeem_check(self, name: str, current_points: int):
+        if not getattr(self, "auto_redeem", None) or not self.auto_redeem.enabled or current_points <= 0:
+            return
+        try:
+            redeem_results = await self.auto_redeem.check_and_redeem(
+                streamer=name,
+                current_points=current_points,
+                token=self.token,
+                account_alias=self.alias,
+                proxy=self.proxy
+            )
+            if redeem_results and self._telegram:
+                for res in redeem_results:
+                    if res.get("status") == "success" and hasattr(self._telegram, "send_reward_redeemed"):
+                        await self._telegram.send_reward_redeemed(
+                            account_alias=self.alias,
+                            streamer=name,
+                            reward_title=res.get("reward", "Reward"),
+                            cost=res.get("cost", 0),
+                            balance_remaining=max(0, current_points - res.get("cost", 0)),
+                            message_sent=res.get("message_sent", ""),
+                            description=res.get("description", "")
+                        )
+                    elif res.get("status") == "upi_ready_alert" and hasattr(self._telegram, "send_upi_reward_ready"):
+                        await self._telegram.send_upi_reward_ready(
+                            account_alias=self.alias,
+                            streamer=name,
+                            reward_title=res.get("reward", "UPI Reward"),
+                            cost=res.get("cost", 0),
+                            balance=current_points,
+                            upi_id=res.get("upi_id", "patelnand@fam")
+                        )
+        except Exception as e:
+            logger.debug(f"[{self.alias}] Auto-redeem check error: {e}")
 
     async def _prediction_loop(self, name: str):
         st = self.state.streamers[name]
@@ -1771,6 +1819,23 @@ class AccountManager:
         self.stagger_min = config.get("Connection_stagger_min", 3)
         self.stagger_max = config.get("Connection_stagger_max", 8)
         self.prediction_cfg = config.get("Predictions", {})
+        self.auto_redeem_cfg = config.get("AutoRedeem", {})
+        cg_cfg = config.get("CrossGamble", {})
+        self.cross_gamble = None
+        if cg_cfg.get("enabled", True):
+            try:
+                from utils.cross_gamble import CrossGambleOrchestrator
+                self.cross_gamble = CrossGambleOrchestrator(
+                    hero_alias=cg_cfg.get("hero_alias", "4 valo 01"),
+                    hero_bet_pct=float(cg_cfg.get("hero_bet_pct", 0.30)),
+                    feeder_bet_pct=float(cg_cfg.get("feeder_bet_pct", 0.50)),
+                    max_hero_bet=int(cg_cfg.get("max_hero_bet", 15000)),
+                    max_feeder_bet=int(cg_cfg.get("max_feeder_bet", 5000)),
+                    min_consensus_pct=float(cg_cfg.get("min_consensus_pct", 55.0))
+                )
+                logger.info(f"🎲 CrossGamble engine active with Hero [{self.cross_gamble.hero_alias}]")
+            except Exception as e_cg:
+                logger.error(f"Failed to initialize CrossGamble: {e_cg}")
 
         # Common streamers list
         common_streamers = config.get("Streamers", [])
@@ -1949,13 +2014,17 @@ class AccountManager:
 
     async def start_all(self):
         self._is_stopped = False
+
+        # Launch central background services immediately
+        if getattr(self, "cross_gamble", None):
+            self._tasks.append(asyncio.create_task(self._cross_gamble_loop()))
+        self._tasks.append(asyncio.create_task(self._auto_redeem_scanner_loop()))
+
+        delay_min, delay_max = (0.5, 1.2)
+        logger.info(f"🚀 Launching all {len(self.workers)} accounts (stagger {delay_min}-{delay_max}s)...")
         for i, worker in enumerate(self.workers):
             if i > 0:
-                delay = random.uniform(5, 15)
-                logger.info(
-                    f"⏳ Delay {delay:.0f}s before "
-                    f"account [{worker.alias}]"
-                )
+                delay = random.uniform(delay_min, delay_max)
                 await asyncio.sleep(delay)
 
             task = asyncio.create_task(worker.start())
@@ -1980,6 +2049,211 @@ class AccountManager:
             task.cancel()
         for w in self.workers:
             await w.stop()
+
+    async def _cross_gamble_loop(self):
+        """High-performance central loop monitoring live predictions across streamers to execute cross-gamble pool funneling."""
+        logger.info(f"🎲 Central Cross-Gamble Funnel active: funneling pool into [{self.cross_gamble.hero_alias}]")
+        await asyncio.sleep(5)
+        pred_client = KickPrediction()
+
+        while not self._is_stopped:
+            try:
+                # Concurrent check across all monitored streamers
+                async def _poll_streamer_pred(s_name: str):
+                    try:
+                        p_data = await asyncio.to_thread(pred_client.get_latest_prediction, s_name)
+                        if not p_data:
+                            return None
+                        p_obj = self.cross_gamble.parse_prediction(p_data)
+                        if not p_obj:
+                            return None
+                        if p_obj["id"] in self.cross_gamble.processed_predictions:
+                            return None
+                        return s_name, p_obj
+                    except Exception:
+                        return None
+
+                poll_tasks = [_poll_streamer_pred(s) for s in list(self.common_streamers)]
+                active_predictions = await asyncio.gather(*poll_tasks)
+
+                for item in active_predictions:
+                    if not item:
+                        continue
+                    streamer, pred_obj = item
+                    pred_id = pred_obj["id"]
+
+                    remaining = pred_obj.get("remaining_seconds", 30)
+                    is_controlled = (streamer.lower() == "xyroplayzz")
+
+                    # Timing window:
+                    # Controlled test channel (xyroplayzz): execute immediately if remaining >= 2
+                    # Public stream: execute when remaining <= 30 and remaining >= 3
+                    if is_controlled:
+                        if remaining < 2:
+                            continue
+                    else:
+                        if remaining > 30 or remaining < 3:
+                            continue
+
+                    analysis = self.cross_gamble.analyze_prediction(pred_obj, streamer)
+                    if not analysis:
+                        continue
+
+                    # Ensure Hero account points are freshly known
+                    hero_w = next((w for w in self.workers if w.alias == self.cross_gamble.hero_alias), None)
+                    if hero_w:
+                        h_st = hero_w.state.streamers.get(streamer)
+                        if not h_st or (h_st.points or 0) < 10:
+                            try:
+                                h_pts = await asyncio.to_thread(hero_w._get_points_checker().get_amount, streamer, hero_w.token)
+                                if h_pts and h_st:
+                                    h_st.points = h_pts
+                            except Exception:
+                                pass
+
+                    # Refresh points for zero-point workers concurrently
+                    zero_pt_workers = [
+                        w for w in self.workers
+                        if w.token_valid and ((w.state.streamers.get(streamer).points if w.state.streamers.get(streamer) else 0) < 10)
+                    ][:35]
+                    if zero_pt_workers:
+                        async def _refresh_w_pts(worker):
+                            try:
+                                await asyncio.sleep(random.uniform(0.05, 0.4))
+                                p = await asyncio.to_thread(worker._get_points_checker().get_amount, streamer, worker.token)
+                                if p and worker.state.streamers.get(streamer):
+                                    worker.state.streamers[streamer].points = p
+                            except Exception:
+                                pass
+                        await asyncio.gather(*[_refresh_w_pts(w) for w in zero_pt_workers])
+
+                    # Collect eligible accounts
+                    accounts_data = []
+                    for w in self.workers:
+                        if not w.token_valid:
+                            continue
+                        st = w.state.streamers.get(streamer)
+                        pts = st.points if st else 0
+                        if pts >= 10:
+                            accounts_data.append({
+                                "alias": w.alias,
+                                "points": pts,
+                                "token": w.token,
+                                "worker": w
+                            })
+
+                    if not accounts_data:
+                        logger.debug(f"[{streamer}] No accounts with >= 10 points for cross-gamble")
+                        continue
+
+                    bets = self.cross_gamble.compute_bets(analysis, accounts_data)
+                    logger.info(f"⚡ Cross-gamble dispatching {len(bets)} bets concurrently on {streamer} for '{analysis['title']}'...")
+
+                    # Mark processed right away so concurrent ticks do not duplicate
+                    self.cross_gamble.processed_predictions.add(pred_id)
+
+                    # Priority execution: Hero bets FIRST, Feeders follow with paced stagger to prevent 429
+                    async def _place_single_bet(b, max_retries=3):
+                        acc = b["account"]
+                        amt = b["amount"]
+                        out_id = b["outcome_id"]
+                        out_title = b["outcome_title"]
+                        role = b["role"]
+                        for attempt in range(max_retries):
+                            try:
+                                ok, res = await asyncio.to_thread(
+                                    pred_client.vote_prediction,
+                                    streamer, out_id, amt, acc["token"]
+                                )
+                                if ok:
+                                    odds_val = analysis.get("hero_odds" if b["is_hero"] else "feeder_odds", 1.0)
+                                    logger.success(f"[{acc['alias']}] 🎯 [{role}] Voted {amt:,} pts on '{out_title}' (Odds: {odds_val:.2f}x)")
+                                    if acc.get("worker") and acc["worker"].state.streamers.get(streamer):
+                                        acc["worker"].state.streamers[streamer].points = max(0, acc["points"] - amt)
+                                    return True, b
+                                else:
+                                    res_str = str(res)
+                                    if "429" in res_str or "TOO_MANY_REQUESTS" in res_str:
+                                        logger.warning(f"[{acc['alias']}] ⏳ Rate limited (429) on vote, backing off {0.5 * (attempt + 1)}s (attempt {attempt+1}/{max_retries})")
+                                        await asyncio.sleep(0.5 * (attempt + 1))
+                                        continue
+                                    logger.warning(f"[{acc['alias']}] ⚠️ Cross-gamble vote: {res}")
+                                    return False, b
+                            except Exception as e_vote:
+                                logger.error(f"[{acc['alias']}] Vote error: {e_vote}")
+                                await asyncio.sleep(0.3)
+                        return False, b
+
+                    hero_b = next((b for b in bets if b.get("is_hero")), None)
+                    feeder_bets = [b for b in bets if not b.get("is_hero")]
+                    executed_bets = []
+
+                    # Step 1: Place HERO bet FIRST
+                    if hero_b:
+                        logger.info(f"👑 Executing Hero [{self.cross_gamble.hero_alias}] bet FIRST on '{hero_b['outcome_title']}' ({hero_b['amount']:,} pts)...")
+                        ok_hero, _ = await _place_single_bet(hero_b, max_retries=5)
+                        if ok_hero:
+                            executed_bets.append(hero_b)
+                        else:
+                            logger.error(f"🚨 Failed to place Hero bet for [{self.cross_gamble.hero_alias}]!")
+
+                    # Step 2: Place Feeder bets with controlled 0.18s spacing (no 429)
+                    for fb in feeder_bets:
+                        await asyncio.sleep(random.uniform(0.15, 0.25))
+                        ok_f, _ = await _place_single_bet(fb, max_retries=2)
+                        if ok_f:
+                            executed_bets.append(fb)
+
+                    # Telegram notification
+                    if self._telegram and hasattr(self._telegram, "_get_recipients") and executed_bets:
+                        hero_b = next((b for b in executed_bets if b.get("is_hero")), None)
+                        hero_str = f"{hero_b['amount']:,} pts on <b>{analysis['hero_outcome_title']}</b>" if hero_b else "None"
+                        feeder_total = sum(b["amount"] for b in executed_bets if not b.get("is_hero"))
+                        feeder_count = len([b for b in executed_bets if not b.get("is_hero")])
+                        msg = (
+                            f"🎲 <b>CROSS-GAMBLE EXECUTED!</b>\n\n"
+                            f"👤 <b>Streamer:</b> <code>{html.escape(streamer)}</code>\n"
+                            f"🎯 <b>Prediction:</b> <i>{html.escape(analysis['title'])}</i>\n"
+                            f"👑 <b>Hero [{self.cross_gamble.hero_alias}]:</b> {hero_str}\n"
+                            f"👥 <b>Feeders ({feeder_count}):</b> {feeder_total:,} pts into <b>{analysis['feeder_outcome_title']}</b>\n"
+                            f"📊 <b>Strategy:</b> <code>{analysis['strategy'].upper()}</code>\n"
+                            f"⚡ <i>Pool liquidity pumped & odds optimized!</i>"
+                        )
+                        for uid in self._telegram._get_recipients():
+                            await self._telegram._send(uid, msg)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e_main:
+                logger.debug(f"Cross-gamble loop tick notice: {e_main}")
+
+            await asyncio.sleep(4)
+
+    async def _auto_redeem_scanner_loop(self):
+        """Periodic background scanner checking target rewards across all streamers."""
+        logger.info("🎁 Background Auto-Redeem Scanner active: checking target rewards every 10m")
+        await asyncio.sleep(20)
+        while not self._is_stopped:
+            try:
+                for worker in list(self.workers):
+                    if not worker.token_valid or not getattr(worker, "auto_redeem", None) or not worker.auto_redeem.enabled:
+                        continue
+                    for streamer in list(self.common_streamers):
+                        try:
+                            pts = await asyncio.to_thread(worker._get_points_checker().get_amount, streamer, worker.token)
+                            if pts and pts > 0:
+                                st = worker.state.streamers.get(streamer)
+                                if st:
+                                    st.points = pts
+                                await worker._auto_redeem_check(streamer, pts)
+                        except Exception as e_s:
+                            logger.debug(f"[{worker.alias}] Scanner check for {streamer} skipped: {e_s}")
+                        await asyncio.sleep(2)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug(f"Auto-redeem scanner loop error: {e}")
+            await asyncio.sleep(600)
 
     def get_all_status(self) -> List[dict]:
         return [w.get_status() for w in self.workers]
