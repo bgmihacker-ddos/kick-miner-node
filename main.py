@@ -46,30 +46,47 @@ def _perform_health_query(url: str) -> int:
         return response.getcode()
 
 
-async def start_healthcheck_query(target_url: str, interval: int = 60):
-    logger.info("💓 Render Keep-Alive / Healthcheck query active")
-    logger.info(f"🎯 Target URL: {target_url} (querying every {interval}s)")
+async def start_healthcheck_query(target_url: str = "", interval: int = 300):
+    """
+    Render Cross-Miner Anti-Sleep Mesh:
+    Pings Master Panel and all miner nodes every 5 minutes (300s).
+    Ensures neither Master Panel nor any miner in the Render cluster ever goes to sleep.
+    """
+    endpoints = [
+        ("Master Panel", "https://kick-master-panel-pwz6.onrender.com/health"),
+        ("Miner 2 (Self)", "https://miner-2-dl7d.onrender.com/health"),
+        ("Miner 3 (Singapore)", "https://miner-3-1.onrender.com/health"),
+        ("Miner 4 (Frankfurt)", "https://miner-4.onrender.com/health"),
+        ("Miner 5 (Oregon)", "https://miner-5-y5rn.onrender.com/health"),
+        ("Miner 6 (Ohio)", "https://miner-6.onrender.com/health"),
+        ("Miner 7 (Virginia)", "https://miner-7.onrender.com/health"),
+        ("Miner 8 (Frankfurt)", "https://miner-8.onrender.com/health"),
+    ]
 
-    # Wait 10 seconds before initial ping to allow the web server to start up
-    await asyncio.sleep(10)
+    logger.info(f"💓 Render Anti-Sleep Cross-Pinger active (monitoring {len(endpoints)} nodes every {interval}s)")
+    await asyncio.sleep(15)
 
-    ping_count = 0
+    pulse_count = 0
     while True:
         try:
-            status_code = await asyncio.to_thread(_perform_health_query, target_url)
-            ping_count += 1
-            if ping_count == 1 or ping_count % 10 == 0 or status_code != 200:
-                logger.info(
-                    f"💓 Healthcheck query #{ping_count} to {target_url} -> HTTP {status_code} (Render keep-alive OK)"
-                )
-            else:
-                logger.debug(
-                    f"💓 Healthcheck query #{ping_count} to {target_url} -> HTTP {status_code}"
-                )
+            pulse_count += 1
+            success_count = 0
+            for name, url in endpoints:
+                try:
+                    code = await asyncio.to_thread(_perform_health_query, url)
+                    if code == 200:
+                        success_count += 1
+                    else:
+                        logger.debug(f"[AntiSleep] {name} returned HTTP {code}")
+                except Exception as ex:
+                    logger.debug(f"[AntiSleep] {name} ping notice: {ex}")
+
+            if pulse_count == 1 or pulse_count % 3 == 0 or success_count < len(endpoints):
+                logger.info(f"💓 [AntiSleep Pulse #{pulse_count}] {success_count}/{len(endpoints)} nodes kept awake & online")
         except asyncio.CancelledError:
             break
         except Exception as e:
-            logger.warning(f"⚠️ Healthcheck query to {target_url} failed: {e}")
+            logger.warning(f"⚠️ Anti-Sleep cross-ping loop notice: {e}")
 
         await asyncio.sleep(interval)
 
@@ -151,22 +168,40 @@ async def main():
         except Exception as e:
             logger.error(f"Web Dashboard failed to start: {e}")
 
-    # 6. Render Keep-Alive / Healthcheck query task (every 60 sec)
+    # 6. Render Anti-Sleep Cross-Pinger Mesh (every 5 minutes / 300s)
     health_cfg = config.get("HealthCheck", {})
     if health_cfg.get("enabled", True):
-        interval = health_cfg.get("interval", 60)
-        configured_url = health_cfg.get("url") or os.environ.get("HEALTHCHECK_URL")
+        interval = health_cfg.get("interval", 300)
+        asyncio.create_task(start_healthcheck_query(interval=interval))
 
-        if configured_url:
-            health_url = configured_url
-        elif os.environ.get("RENDER_EXTERNAL_HOSTNAME"):
-            health_url = f"https://{os.environ.get('RENDER_EXTERNAL_HOSTNAME').rstrip('/')}/health"
-        elif os.environ.get("RENDER_EXTERNAL_URL"):
-            health_url = f"{os.environ.get('RENDER_EXTERNAL_URL').rstrip('/')}/health"
-        else:
-            health_url = f"http://127.0.0.1:{port}/health"
+    # 6.5. Render Memory Guard (aggressive GC above 320MB to prevent Render 512MB OOM)
+    async def _memory_guard_loop():
+        import gc
+        try:
+            import psutil
+            proc = psutil.Process()
+        except Exception:
+            proc = None
 
-        asyncio.create_task(start_healthcheck_query(health_url, interval=interval))
+        tick = 0
+        while True:
+            try:
+                tick += 1
+                if proc:
+                    rss_mb = proc.memory_info().rss / 1024 / 1024
+                    if rss_mb > 320.0:
+                        before = rss_mb
+                        gc.collect()
+                        after = proc.memory_info().rss / 1024 / 1024
+                        logger.warning(f"🧹 [MemoryGuard] High RAM ({before:.1f}MB) -> Reclaimed to {after:.1f}MB")
+                if tick % 4 == 0:
+                    gc.collect()
+            except Exception:
+                pass
+            await asyncio.sleep(30)
+
+    asyncio.create_task(_memory_guard_loop())
+    logger.info("🛡️ Render Memory Guard active (protecting 512MB RAM limit)")
 
     # 7. Send startup notifications
     if discord_hook.enabled:
