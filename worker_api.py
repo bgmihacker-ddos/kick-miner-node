@@ -82,6 +82,17 @@ class WorkerAPI:
                 self._send_json_response(writer, 200, data)
                 return
 
+            if method == "POST" and (path == "/bet" or path == "/api/bet"):
+                data = await self._handle_bet_dispatch(body_bytes)
+                code = 200 if data.get("success") else 400
+                self._send_json_response(writer, code, data)
+                return
+
+            if method == "GET" and path == "/api/accounts":
+                data = self._get_accounts_data()
+                self._send_json_response(writer, 200, data.get("accounts", []))
+                return
+
             if method == "POST" and path == "/chat":
                 data = await self._handle_chat_dispatch(body_bytes)
                 code = 200 if data.get("success") else 400
@@ -163,6 +174,42 @@ class WorkerAPI:
                 "watching_channels": watching
             })
         return {"accounts": accounts_data}
+
+    async def _handle_bet_dispatch(self, body_bytes: bytes) -> dict:
+        try:
+            body = json.loads(body_bytes.decode("utf-8", errors="ignore")) if body_bytes else {}
+        except Exception:
+            return {"success": False, "error": "Invalid JSON body"}
+
+        alias = body.get("alias") or body.get("account")
+        streamer = body.get("streamer")
+        outcome_id = body.get("outcome_id")
+        amount = body.get("amount", 0)
+
+        if not alias or not streamer or not outcome_id or amount <= 0:
+            return {"success": False, "error": "Missing required fields"}
+
+        target_worker = next((w for w in self.account_manager.workers if w.alias == alias), None)
+        if not target_worker:
+            return {"success": False, "error": f"Account '{alias}' not found"}
+
+        try:
+            from utils.kick_prediction import KickPrediction
+            pred_client = KickPrediction()
+            ok, res = await asyncio.to_thread(
+                pred_client.vote_prediction,
+                streamer, outcome_id, amount, target_worker.token
+            )
+            if ok:
+                st = target_worker.state.streamers.get(streamer)
+                if st and st.points:
+                    st.points = max(0, st.points - amount)
+                logger.success(f"[{alias}] 🎯 WorkerAPI Bet: Voted {amount:,} pts on {streamer} outcome {outcome_id}")
+                return {"success": True, "result": res}
+            else:
+                return {"success": False, "error": str(res)}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
 
     async def _handle_chat_dispatch(self, body_bytes: bytes) -> dict:
         try:

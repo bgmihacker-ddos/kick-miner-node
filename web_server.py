@@ -1167,6 +1167,43 @@ def trigger_rebalance_now():
     return jsonify(results)
 
 
+@app.route('/api/bet', methods=['POST'])
+def handle_master_bet():
+    """Allows Master Panel to command an account on this worker to place a bet."""
+    from flask import request
+    data = request.get_json(silent=True) or {}
+    alias = data.get("alias")
+    streamer = data.get("streamer")
+    outcome_id = data.get("outcome_id")
+    amount = data.get("amount", 0)
+
+    if not alias or not streamer or not outcome_id or amount <= 0:
+        return jsonify({"success": False, "error": "Missing required fields"}), 400
+
+    if not _account_manager:
+        return jsonify({"success": False, "error": "Account manager not initialized"}), 500
+
+    worker = next((w for w in _account_manager.workers if w.alias == alias), None)
+    if not worker:
+        return jsonify({"success": False, "error": f"Account '{alias}' not found on this worker"}), 404
+
+    try:
+        from utils.kick_prediction import KickPrediction
+        pred_client = KickPrediction()
+        ok, res = pred_client.vote_prediction(streamer, outcome_id, amount, worker.token)
+        if ok:
+            st = worker.state.streamers.get(streamer)
+            if st and st.points:
+                st.points = max(0, st.points - amount)
+            logger.success(f"[{alias}] 🎯 Master Bet: Voted {amount:,} pts on {streamer} outcome {outcome_id}")
+            return jsonify({"success": True, "result": res})
+        else:
+            return jsonify({"success": False, "error": str(res)}), 400
+    except Exception as e:
+        logger.error(f"[{alias}] Error voting: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 _server_started = False
 _server_port = None
 
