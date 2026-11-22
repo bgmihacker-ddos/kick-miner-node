@@ -2,7 +2,7 @@ import threading
 import json
 import time
 import os
-from flask import Flask, render_template_string, jsonify, send_file
+from flask import Flask, render_template_string, jsonify, send_file, request
 from collections import deque
 from loguru import logger
 from datetime import datetime
@@ -1020,6 +1020,48 @@ def get_live():
     return jsonify({"any_live": False, "live_count": 0, "live_streamers": [], "offline_streamers": []})
 
 
+@app.route('/api/bet', methods=['POST'])
+def place_bet_endpoint():
+    global _account_manager
+    if _account_manager is None:
+        return jsonify({"success": False, "error": "AccountManager not initialized"}), 503
+
+    try:
+        data = request.get_json(force=True) or {}
+        alias = data.get("alias")
+        streamer = data.get("streamer")
+        outcome_id = data.get("outcome_id")
+        amount = int(data.get("amount", 10))
+
+        if not alias or not streamer or not outcome_id:
+            return jsonify({"success": False, "error": "Missing parameters (alias, streamer, outcome_id)"}), 400
+
+        worker = next((w for w in _account_manager.workers if w.alias == alias), None)
+        if not worker:
+            return jsonify({"success": False, "error": f"Account {alias} not found on this worker"}), 404
+
+        token = worker.token
+        proxy = worker.proxy
+        from utils.kick_prediction import KickPrediction
+        pred_client = KickPrediction(proxy=proxy)
+        ok, res = pred_client.vote_prediction(streamer, outcome_id, amount, token)
+        if not ok and proxy:
+            # Fallback to direct connection if proxy failed
+            logger.info(f"[{alias}] Retrying vote via direct connection (proxy failed: {res})...")
+            pred_client_direct = KickPrediction(proxy=None)
+            ok, res = pred_client_direct.vote_prediction(streamer, outcome_id, amount, token)
+
+        if ok:
+            logger.success(f"[{alias}] Bet placed via /api/bet: {amount} pts on {outcome_id} ({streamer})")
+            return jsonify({"success": True, "result": res})
+        else:
+            logger.warning(f"[{alias}] Bet failed via /api/bet: {res}")
+            return jsonify({"success": False, "error": res})
+    except Exception as e:
+        logger.error(f"Error in /api/bet: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 @app.route('/api/bets')
 def get_bets():
     global _account_manager
@@ -1165,43 +1207,6 @@ def trigger_rebalance_now():
         except Exception as e:
             results[-1]["rebalance_err"] = str(e)
     return jsonify(results)
-
-
-@app.route('/api/bet', methods=['POST'])
-def handle_master_bet():
-    """Allows Master Panel to command an account on this worker to place a bet."""
-    from flask import request
-    data = request.get_json(silent=True) or {}
-    alias = data.get("alias")
-    streamer = data.get("streamer")
-    outcome_id = data.get("outcome_id")
-    amount = data.get("amount", 0)
-
-    if not alias or not streamer or not outcome_id or amount <= 0:
-        return jsonify({"success": False, "error": "Missing required fields"}), 400
-
-    if not _account_manager:
-        return jsonify({"success": False, "error": "Account manager not initialized"}), 500
-
-    worker = next((w for w in _account_manager.workers if w.alias == alias), None)
-    if not worker:
-        return jsonify({"success": False, "error": f"Account '{alias}' not found on this worker"}), 404
-
-    try:
-        from utils.kick_prediction import KickPrediction
-        pred_client = KickPrediction()
-        ok, res = pred_client.vote_prediction(streamer, outcome_id, amount, worker.token)
-        if ok:
-            st = worker.state.streamers.get(streamer)
-            if st and st.points:
-                st.points = max(0, st.points - amount)
-            logger.success(f"[{alias}] 🎯 Master Bet: Voted {amount:,} pts on {streamer} outcome {outcome_id}")
-            return jsonify({"success": True, "result": res})
-        else:
-            return jsonify({"success": False, "error": str(res)}), 400
-    except Exception as e:
-        logger.error(f"[{alias}] Error voting: {e}")
-        return jsonify({"success": False, "error": str(e)}), 500
 
 
 _server_started = False
