@@ -734,7 +734,8 @@ class AccountWorker:
             st.points_task = asyncio.create_task(
                 self._points_loop(name)
             )
-            if self.predictions_enabled:
+            is_worker_mode = getattr(self, "worker_mode", False) or bool(getattr(self, "config", {}).get("WorkerMode", False))
+            if self.predictions_enabled and not is_worker_mode:
                 st.prediction_task = asyncio.create_task(
                     self._prediction_loop(name)
                 )
@@ -2019,6 +2020,7 @@ class AccountManager:
         if getattr(self, "cross_gamble", None):
             self._tasks.append(asyncio.create_task(self._cross_gamble_loop()))
         self._tasks.append(asyncio.create_task(self._auto_redeem_scanner_loop()))
+        self._tasks.append(asyncio.create_task(self._memory_trim_loop()))
 
         delay_min, delay_max = (0.5, 1.2)
         logger.info(f"🚀 Launching all {len(self.workers)} accounts (stagger {delay_min}-{delay_max}s)...")
@@ -2228,6 +2230,24 @@ class AccountManager:
                 logger.debug(f"Cross-gamble loop tick notice: {e_main}")
 
             await asyncio.sleep(4)
+
+    async def _memory_trim_loop(self):
+        """Active memory optimizer for 512MB RAM environments. Frees unmapped heap pages to OS."""
+        import gc
+        import ctypes
+        libc = None
+        try:
+            libc = ctypes.CDLL("libc.so.6")
+        except Exception:
+            pass
+        while not self._is_stopped:
+            await asyncio.sleep(45)
+            gc.collect()
+            if libc and hasattr(libc, "malloc_trim"):
+                try:
+                    libc.malloc_trim(0)
+                except Exception:
+                    pass
 
     async def _auto_redeem_scanner_loop(self):
         """Periodic background scanner checking target rewards across all streamers."""
