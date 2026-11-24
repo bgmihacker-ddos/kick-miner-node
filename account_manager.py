@@ -471,11 +471,12 @@ class AccountWorker:
                 else:
                     offline_streamers.append(name)
 
-                if not was_online and st.is_online:
-                    logger.info(
-                        f"[{self.alias}] 🟢 {name} "
-                        f"ONLINE (stream={stream_id})"
-                    )
+                if st.is_online and (not was_online or st.points == 0):
+                    if not was_online:
+                        logger.info(
+                            f"[{self.alias}] 🟢 {name} "
+                            f"ONLINE (stream={stream_id})"
+                        )
                     try:
                         pts = await asyncio.to_thread(self._get_points_checker().get_amount, name, self.token)
                         if pts is not None:
