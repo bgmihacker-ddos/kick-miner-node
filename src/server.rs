@@ -203,7 +203,9 @@ async fn place_bet_handler(
 
     // If points in memory < 10 or amount is 0, fetch live points
     if pts < 10 || requested_amount == 0 {
-        if let Some(live_pts) = get_live_points(&client, &payload.streamer, &token).await {
+        if let Some(live_pts) =
+            get_live_points(&client, &payload.streamer, &token, proxy.as_deref()).await
+        {
             pts = live_pts;
             let mut s = state.write().await;
             s.set_points(&account_alias, &payload.streamer, live_pts);
@@ -211,7 +213,7 @@ async fn place_bet_handler(
             // fallback direct without proxy
             let direct_client = build_http_client(None);
             if let Some(live_pts) =
-                get_live_points(&direct_client, &payload.streamer, &token).await
+                get_live_points(&direct_client, &payload.streamer, &token, None).await
             {
                 pts = live_pts;
                 let mut s = state.write().await;
@@ -243,8 +245,15 @@ async fn place_bet_handler(
     );
 
     // Attempt vote with proxy client
-    let mut vote_res =
-        vote_prediction(&client, &payload.streamer, &payload.outcome_id, final_amount, &token).await;
+    let mut vote_res = vote_prediction(
+        &client,
+        &payload.streamer,
+        &payload.outcome_id,
+        final_amount,
+        &token,
+        proxy.as_deref(),
+    )
+    .await;
 
     // Direct fallback if proxy attempt failed
     if vote_res.is_err() && proxy.is_some() {
@@ -256,6 +265,7 @@ async fn place_bet_handler(
             &payload.outcome_id,
             final_amount,
             &token,
+            None,
         )
         .await;
     }
