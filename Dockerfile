@@ -1,36 +1,30 @@
-FROM python:3.11-slim AS builder
+# Build Stage
+FROM rust:1.80-bookworm AS builder
 
-WORKDIR /build
+WORKDIR /usr/src/kick_miner
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        gcc \
-        libcurl4-openssl-dev \
-        libssl-dev \
-    && rm -rf /var/lib/apt/lists/*
+COPY Cargo.toml Cargo.lock* ./
+RUN mkdir src && echo "fn main() {}" > src/main.rs
+RUN cargo build --release || true
+RUN rm -rf src target/release/deps/kick_miner*
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+COPY src ./src
+RUN cargo build --release
 
-FROM python:3.11-slim
-
-LABEL org.opencontainers.image.title="Kick Channel Points Miner" \
-      org.opencontainers.image.description="Automated Kick channel-points farmer" \
-      org.opencontainers.image.source="https://github.com/Baillora/Kick_Channel_Points_Miner"
+# Runtime Stage
+FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libcurl4 \
-        git \
-        ca-certificates \
+    ca-certificates \
+    curl \
     && rm -rf /var/lib/apt/lists/*
-
-COPY --from=builder /install /usr/local
 
 WORKDIR /app
 
-COPY . .
+COPY --from=builder /usr/src/kick_miner/target/release/kick_miner /usr/local/bin/kick_miner
+COPY config*.json ./
 
-ENV PYTHONUNBUFFERED=1
+ENV PORT=10000
+EXPOSE 10000
 
-EXPOSE 5000
-
-CMD ["python", "main.py"]
+CMD ["/usr/local/bin/kick_miner"]
