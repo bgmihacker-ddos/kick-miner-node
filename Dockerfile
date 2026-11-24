@@ -20,7 +20,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libssl3 \
     curl \
+    tar \
+    procps \
     && rm -rf /var/lib/apt/lists/*
+
+# Install curl-impersonate Chrome binary to bypass Cloudflare TLS fingerprints
+RUN curl -sSL https://github.com/lwthiker/curl-impersonate/releases/download/v0.6.1/curl-impersonate-v0.6.1.x86_64-linux-gnu.tar.gz | tar -xz -C /usr/local/bin && chmod +x /usr/local/bin/curl*
 
 WORKDIR /app
 
