@@ -1031,7 +1031,7 @@ def place_bet_endpoint():
         alias = data.get("alias")
         streamer = data.get("streamer")
         outcome_id = data.get("outcome_id")
-        amount = int(data.get("amount", 10))
+        amount = int(data.get("amount", 0))
 
         if not alias or not streamer or not outcome_id:
             return jsonify({"success": False, "error": "Missing parameters (alias, streamer, outcome_id)"}), 400
@@ -1042,6 +1042,36 @@ def place_bet_endpoint():
 
         token = worker.token
         proxy = worker.proxy
+
+        # 1. Check points in worker memory
+        st = worker.state.streamers.get(streamer)
+        pts = st.points if st and st.points else 0
+
+        # 2. If points < 10 or amount <= 0, query live points from Kick directly
+        if pts < 10 or amount <= 0:
+            try:
+                checker = worker._get_points_checker()
+                live_pts = checker.get_amount(streamer, token)
+                if (live_pts is None or live_pts < 10) and proxy:
+                    from utils.get_points_amount import PointsAmount
+                    checker_direct = PointsAmount(proxy=None)
+                    live_pts = checker_direct.get_amount(streamer, token)
+                if live_pts is not None:
+                    pts = live_pts
+                    if st:
+                        st.points = live_pts
+            except Exception as e:
+                logger.debug(f"[{alias}] Error fetching live points for {streamer}: {e}")
+
+        if pts < 10:
+            return jsonify({"success": False, "error": f"Insufficient points ({pts})", "skipped": True}), 200
+
+        # 3. Calculate bet amount: if 0, bet 25% of live points (min 10, max 500)
+        if amount <= 0:
+            amount = max(10, min(500, int(pts * 0.25)))
+        else:
+            amount = min(amount, pts)
+
         from utils.kick_prediction import KickPrediction
         pred_client = KickPrediction(proxy=proxy)
         ok, res = pred_client.vote_prediction(streamer, outcome_id, amount, token)
@@ -1052,8 +1082,10 @@ def place_bet_endpoint():
             ok, res = pred_client_direct.vote_prediction(streamer, outcome_id, amount, token)
 
         if ok:
+            if st:
+                st.points = max(0, pts - amount)
             logger.success(f"[{alias}] Bet placed via /api/bet: {amount} pts on {outcome_id} ({streamer})")
-            return jsonify({"success": True, "result": res})
+            return jsonify({"success": True, "result": res, "amount": amount})
         else:
             logger.warning(f"[{alias}] Bet failed via /api/bet: {res}")
             return jsonify({"success": False, "error": res})
