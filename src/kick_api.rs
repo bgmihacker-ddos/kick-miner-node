@@ -1,4 +1,6 @@
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, ORIGIN, REFERER, USER_AGENT};
+use reqwest::header::{
+    HeaderMap, HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, ORIGIN, REFERER, USER_AGENT,
+};
 use reqwest::{Client, Proxy};
 use serde_json::Value;
 use std::time::Duration;
@@ -13,8 +15,44 @@ pub fn build_http_client(proxy_url: Option<&str>) -> Client {
         ),
     );
     headers.insert(ACCEPT, HeaderValue::from_static("application/json, text/plain, */*"));
+    headers.insert(
+        HeaderName::from_static("accept-language"),
+        HeaderValue::from_static("en-US,en;q=0.9"),
+    );
     headers.insert(ORIGIN, HeaderValue::from_static("https://kick.com"));
     headers.insert(REFERER, HeaderValue::from_static("https://kick.com/"));
+    headers.insert(
+        HeaderName::from_static("x-client-token"),
+        HeaderValue::from_static("e1393935a959b4020a4491574f6490129f678acdaa92760471263db43487f823"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-requested-with"),
+        HeaderValue::from_static("XMLHttpRequest"),
+    );
+    headers.insert(
+        HeaderName::from_static("sec-ch-ua"),
+        HeaderValue::from_static("\"Chromium\";v=\"120\", \"Google Chrome\";v=\"120\", \"Not?A_Brand\";v=\"99\""),
+    );
+    headers.insert(
+        HeaderName::from_static("sec-ch-ua-mobile"),
+        HeaderValue::from_static("?0"),
+    );
+    headers.insert(
+        HeaderName::from_static("sec-ch-ua-platform"),
+        HeaderValue::from_static("\"Windows\""),
+    );
+    headers.insert(
+        HeaderName::from_static("sec-fetch-dest"),
+        HeaderValue::from_static("empty"),
+    );
+    headers.insert(
+        HeaderName::from_static("sec-fetch-mode"),
+        HeaderValue::from_static("cors"),
+    );
+    headers.insert(
+        HeaderName::from_static("sec-fetch-site"),
+        HeaderValue::from_static("same-site"),
+    );
 
     let mut builder = Client::builder()
         .default_headers(headers)
@@ -43,9 +81,23 @@ pub struct ChannelDetails {
     pub title: String,
 }
 
-pub async fn get_channel_info(client: &Client, streamer: &str) -> Option<ChannelDetails> {
+pub async fn get_channel_info(
+    client: &Client,
+    streamer: &str,
+    auth_token: Option<&str>,
+) -> Option<ChannelDetails> {
     let url = format!("https://kick.com/api/v2/channels/{streamer}");
-    let resp = match client.get(&url).send().await {
+    let mut req = client
+        .get(&url)
+        .header(REFERER, format!("https://kick.com/{streamer}/"));
+
+    if let Some(tok) = auth_token {
+        if !tok.is_empty() {
+            req = req.header(AUTHORIZATION, format!("Bearer {tok}"));
+        }
+    }
+
+    let resp = match req.send().await {
         Ok(r) => r,
         Err(e) => {
             debug!("Channel API error for {streamer}: {e}");
@@ -106,6 +158,7 @@ pub async fn get_ws_token(
         .header("X-Chatroom", channel_id.to_string())
         .header("X-User-Id", user_id.to_string())
         .header(AUTHORIZATION, format!("Bearer {token}"))
+        .header(CONTENT_TYPE, "application/json")
         .send()
         .await
         .ok()?;
