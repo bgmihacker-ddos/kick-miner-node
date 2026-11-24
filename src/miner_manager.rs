@@ -17,20 +17,48 @@ pub async fn run_miner_loop(config: AppConfig, state: SharedState) {
         account_clients.insert(acc.alias.clone(), client);
     }
 
+    // Pick first available account token for authenticated channel status checks
+    let primary_token = config.Accounts.first().map(|a| a.token.clone());
+
     // Active watcher stop senders: key = (alias, streamer)
     let mut active_watchers: HashMap<(String, String), watch::Sender<bool>> = HashMap::new();
     let mut cycle_count: u64 = 0;
 
-    info!("Starting miner loop with interval of {}s", config.Check_interval);
+    info!(
+        "Starting miner loop with interval of {}s across {} streamers and {} accounts",
+        config.Check_interval,
+        config.Streamers.len(),
+        config.Accounts.len()
+    );
+
+    // Initial immediate balance fetch for all accounts on boot
+    info!("Performing initial points balance fetch for all accounts...");
+    for acc in &config.Accounts {
+        let acc_client = account_clients
+            .get(&acc.alias)
+            .cloned()
+            .unwrap_or_else(|| global_client.clone());
+
+        for streamer in &acc.streamers {
+            if let Some(pts) = get_live_points(&acc_client, streamer, &acc.token).await {
+                let mut s = state.write().await;
+                s.set_points(&acc.alias, streamer, pts);
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    }
+    info!("Initial points balance fetch complete!");
 
     loop {
         cycle_count += 1;
         debug!("Miner check cycle #{cycle_count}");
 
-        // 1. Check online status for all streamers
+        // 1. Check online status for all streamers (using primary account token to avoid Cloudflare 403)
         let mut live_streamers: HashMap<String, (u64, u64, u64)> = HashMap::new(); // streamer -> (channel_id, user_id, stream_id)
         for streamer in &config.Streamers {
-            if let Some(details) = get_channel_info(&global_client, streamer).await {
+            if let Some(details) =
+                get_channel_info(&global_client, streamer, primary_token.as_deref()).await
+            {
                 {
                     let mut s = state.write().await;
                     s.update_streamer_online(
@@ -50,7 +78,15 @@ pub async fn run_miner_loop(config: AppConfig, state: SharedState) {
                 }
             }
             // slight stagger between streamer checks
-            sleep(Duration::from_millis(250)).await;
+            sleep(Duration::from_millis(150)).await;
+        }
+
+        if !live_streamers.is_empty() {
+            info!(
+                "Live streamers detected ({}): {:?}",
+                live_streamers.len(),
+                live_streamers.keys().collect::<Vec<_>>()
+            );
         }
 
         // 2. Stop watchers for streamers that are no longer live
@@ -115,14 +151,14 @@ pub async fn run_miner_loop(config: AppConfig, state: SharedState) {
                 }
             }
 
-            // 4. Update points periodically (every 2 cycles or first cycle)
-            if cycle_count % 2 == 1 {
+            // 4. Update points periodically (every 2 cycles)
+            if cycle_count % 2 == 0 {
                 for streamer in &acc.streamers {
                     if let Some(pts) = get_live_points(&acc_client, streamer, &acc.token).await {
                         let mut s = state.write().await;
                         s.set_points(&acc.alias, streamer, pts);
                     }
-                    sleep(Duration::from_millis(150)).await;
+                    sleep(Duration::from_millis(50)).await;
                 }
             }
         }
