@@ -218,22 +218,24 @@ pub async fn get_channel_info(
 pub async fn get_ws_token(
     client: &Client,
     streamer: &str,
-    channel_id: u64,
-    user_id: u64,
+    _channel_id: u64,
+    _user_id: u64,
     token: &str,
     proxy: Option<&str>,
 ) -> Option<String> {
     let url = "https://websockets.kick.com/viewer/v1/token";
     let ref_hdr = format!("https://kick.com/{streamer}/");
     let auth_str = format!("Bearer {token}");
-    let ch_str = channel_id.to_string();
-    let u_str = user_id.to_string();
     let hdrs: Vec<(&str, &str)> = vec![
         ("Accept", "application/json, text/plain, */*"),
+        ("Origin", "https://kick.com"),
         ("Referer", &ref_hdr),
         ("Authorization", &auth_str),
-        ("X-Chatroom", &ch_str),
-        ("X-User-Id", &u_str),
+        (
+            "x-client-token",
+            "e1393935a959b4020a4491574f6490129f678acdaa92760471263db43487f823",
+        ),
+        ("x-requested-with", "XMLHttpRequest"),
     ];
 
     let raw_val: Option<Value> = if let Ok(stdout) = exec_impersonate("GET", url, &hdrs, None, proxy).await {
@@ -242,8 +244,9 @@ pub async fn get_ws_token(
         let resp = client
             .get(url)
             .header(REFERER, &ref_hdr)
-            .header("X-Chatroom", &ch_str)
-            .header("X-User-Id", &u_str)
+            .header(ORIGIN, "https://kick.com")
+            .header("x-client-token", "e1393935a959b4020a4491574f6490129f678acdaa92760471263db43487f823")
+            .header("x-requested-with", "XMLHttpRequest")
             .header(AUTHORIZATION, &auth_str)
             .header(CONTENT_TYPE, "application/json")
             .send()
