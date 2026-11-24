@@ -81,36 +81,107 @@ pub struct ChannelDetails {
     pub title: String,
 }
 
+/// Executes an HTTP request via curl-impersonate (Chrome 116 TLS fingerprint) to bypass Cloudflare
+pub async fn exec_impersonate(
+    method: &str,
+    url: &str,
+    headers: &[(&str, &str)],
+    body: Option<&str>,
+    proxy: Option<&str>,
+) -> Result<String, String> {
+    let curl_bin = if std::path::Path::new("/usr/local/bin/curl_chrome116").exists() {
+        Some("/usr/local/bin/curl_chrome116")
+    } else if std::path::Path::new("curl_chrome116").exists() {
+        Some("curl_chrome116")
+    } else {
+        None
+    };
+
+    let bin = match curl_bin {
+        Some(b) => b,
+        None => return Err("curl_chrome116 not available".to_string()),
+    };
+
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.arg("-s").arg("-S").arg("--max-time").arg("12");
+
+    if method == "POST" {
+        cmd.arg("-X").arg("POST");
+    }
+
+    for (k, v) in headers {
+        cmd.arg("-H").arg(format!("{}: {}", k, v));
+    }
+
+    if let Some(p) = proxy {
+        if !p.is_empty() {
+            cmd.arg("-x").arg(p);
+        }
+    }
+
+    if let Some(b) = body {
+        cmd.arg("-d").arg(b);
+    }
+
+    cmd.arg(url);
+
+    let output = cmd
+        .output()
+        .await
+        .map_err(|e| format!("exec error: {e}"))?;
+
+    let stdout_str = String::from_utf8_lossy(&output.stdout).to_string();
+    if output.status.success() {
+        Ok(stdout_str)
+    } else {
+        let stderr_str = String::from_utf8_lossy(&output.stderr).to_string();
+        Err(format!("curl error: {stderr_str} | stdout: {stdout_str}"))
+    }
+}
+
 pub async fn get_channel_info(
     client: &Client,
     streamer: &str,
     auth_token: Option<&str>,
+    proxy: Option<&str>,
 ) -> Option<ChannelDetails> {
     let url = format!("https://kick.com/api/v2/channels/{streamer}");
-    let mut req = client
-        .get(&url)
-        .header(REFERER, format!("https://kick.com/{streamer}/"));
-
+    let ref_hdr = format!("https://kick.com/{streamer}/");
+    let mut hdrs: Vec<(&str, &str)> = vec![
+        ("Accept", "application/json, text/plain, */*"),
+        ("Referer", &ref_hdr),
+    ];
+    let auth_str;
     if let Some(tok) = auth_token {
         if !tok.is_empty() {
-            req = req.header(AUTHORIZATION, format!("Bearer {tok}"));
+            auth_str = format!("Bearer {tok}");
+            hdrs.push(("Authorization", &auth_str));
         }
     }
 
-    let resp = match req.send().await {
-        Ok(r) => r,
-        Err(e) => {
-            debug!("Channel API error for {streamer}: {e}");
-            return None;
+    let raw_val: Option<Value> = if let Ok(stdout) = exec_impersonate("GET", &url, &hdrs, None, proxy).await {
+        serde_json::from_str::<Value>(&stdout).ok()
+    } else {
+        // Fallback to reqwest
+        let mut req = client.get(&url).header(REFERER, &ref_hdr);
+        if let Some(tok) = auth_token {
+            if !tok.is_empty() {
+                req = req.header(AUTHORIZATION, format!("Bearer {tok}"));
+            }
+        }
+        if let Ok(resp) = req.send().await {
+            if resp.status().is_success() {
+                resp.json().await.ok()
+            } else {
+                debug!("Channel API [{streamer}] HTTP status: {}", resp.status());
+                None
+            }
+        } else {
+            None
         }
     };
 
-    if !resp.status().is_success() {
-        debug!("Channel API [{streamer}] HTTP status: {}", resp.status());
-        return None;
-    }
-
-    let val: Value = resp.json().await.ok()?;
+    let val = raw_val?;
     let channel_id = val.get("id").and_then(|v| v.as_u64())?;
     let user_id = val
         .get("user_id")
@@ -150,25 +221,43 @@ pub async fn get_ws_token(
     channel_id: u64,
     user_id: u64,
     token: &str,
+    proxy: Option<&str>,
 ) -> Option<String> {
     let url = "https://websockets.kick.com/viewer/v1/token";
-    let resp = client
-        .get(url)
-        .header(REFERER, format!("https://kick.com/{streamer}/"))
-        .header("X-Chatroom", channel_id.to_string())
-        .header("X-User-Id", user_id.to_string())
-        .header(AUTHORIZATION, format!("Bearer {token}"))
-        .header(CONTENT_TYPE, "application/json")
-        .send()
-        .await
-        .ok()?;
+    let ref_hdr = format!("https://kick.com/{streamer}/");
+    let auth_str = format!("Bearer {token}");
+    let ch_str = channel_id.to_string();
+    let u_str = user_id.to_string();
+    let hdrs: Vec<(&str, &str)> = vec![
+        ("Accept", "application/json, text/plain, */*"),
+        ("Referer", &ref_hdr),
+        ("Authorization", &auth_str),
+        ("X-Chatroom", &ch_str),
+        ("X-User-Id", &u_str),
+    ];
 
-    if !resp.status().is_success() {
-        warn!("Failed to fetch WS token for {streamer}: HTTP {}", resp.status());
-        return None;
-    }
+    let raw_val: Option<Value> = if let Ok(stdout) = exec_impersonate("GET", url, &hdrs, None, proxy).await {
+        serde_json::from_str::<Value>(&stdout).ok()
+    } else {
+        let resp = client
+            .get(url)
+            .header(REFERER, &ref_hdr)
+            .header("X-Chatroom", &ch_str)
+            .header("X-User-Id", &u_str)
+            .header(AUTHORIZATION, &auth_str)
+            .header(CONTENT_TYPE, "application/json")
+            .send()
+            .await
+            .ok()?;
+        if resp.status().is_success() {
+            resp.json().await.ok()
+        } else {
+            warn!("Failed to fetch WS token for {streamer}: HTTP {}", resp.status());
+            None
+        }
+    };
 
-    let data: Value = resp.json().await.ok()?;
+    let data = raw_val?;
     let ws_tok = data
         .pointer("/data/token")
         .or_else(|| data.pointer("/data/websocket_token"))
@@ -180,12 +269,38 @@ pub async fn get_ws_token(
     ws_tok
 }
 
-pub async fn get_live_points(client: &Client, streamer: &str, token: &str) -> Option<u64> {
+pub async fn get_live_points(
+    client: &Client,
+    streamer: &str,
+    token: &str,
+    proxy: Option<&str>,
+) -> Option<u64> {
     let url = format!("https://kick.com/api/v2/channels/{streamer}/points");
+    let ref_hdr = format!("https://kick.com/{streamer}/");
+    let auth_str = format!("Bearer {token}");
+    let hdrs: Vec<(&str, &str)> = vec![
+        ("Accept", "application/json, text/plain, */*"),
+        ("Referer", &ref_hdr),
+        ("Authorization", &auth_str),
+    ];
+
+    if let Ok(stdout) = exec_impersonate("GET", &url, &hdrs, None, proxy).await {
+        if let Ok(val) = serde_json::from_str::<Value>(&stdout) {
+            let pts = val
+                .pointer("/data/points")
+                .or_else(|| val.get("points"))
+                .and_then(|v| v.as_u64());
+            if let Some(p) = pts {
+                return Some(p);
+            }
+        }
+    }
+
+    // Fallback reqwest
     let resp = client
         .get(&url)
-        .header(AUTHORIZATION, format!("Bearer {token}"))
-        .header(REFERER, format!("https://kick.com/{streamer}/"))
+        .header(AUTHORIZATION, &auth_str)
+        .header(REFERER, &ref_hdr)
         .send()
         .await
         .ok()?;
@@ -201,27 +316,6 @@ pub async fn get_live_points(client: &Client, streamer: &str, token: &str) -> Op
         }
     }
 
-    // Fallback: query /channels/{streamer}
-    let alt_url = format!("https://kick.com/api/v2/channels/{streamer}");
-    if let Ok(alt_resp) = client
-        .get(&alt_url)
-        .header(AUTHORIZATION, format!("Bearer {token}"))
-        .send()
-        .await
-    {
-        if alt_resp.status().is_success() {
-            if let Ok(val) = alt_resp.json::<Value>().await {
-                if let Some(pts) = val
-                    .pointer("/data/user/points")
-                    .or_else(|| val.pointer("/user/points"))
-                    .and_then(|v| v.as_u64())
-                {
-                    return Some(pts);
-                }
-            }
-        }
-    }
-
     None
 }
 
@@ -231,17 +325,36 @@ pub async fn vote_prediction(
     outcome_id: &str,
     amount: u64,
     token: &str,
+    proxy: Option<&str>,
 ) -> Result<Value, String> {
     let url = format!("https://kick.com/api/v2/channels/{streamer}/predictions/vote");
+    let ref_hdr = format!("https://kick.com/{streamer}/");
+    let auth_str = format!("Bearer {token}");
+    let hdrs: Vec<(&str, &str)> = vec![
+        ("Accept", "application/json, text/plain, */*"),
+        ("Referer", &ref_hdr),
+        ("Authorization", &auth_str),
+        ("Content-Type", "application/json"),
+    ];
     let payload = serde_json::json!({
         "amount": amount,
         "outcome_id": outcome_id
     });
+    let payload_str = payload.to_string();
 
+    if let Ok(stdout) = exec_impersonate("POST", &url, &hdrs, Some(&payload_str), proxy).await {
+        if let Ok(v) = serde_json::from_str::<Value>(&stdout) {
+            return Ok(v);
+        } else {
+            return Ok(serde_json::json!({"status": "ok", "raw": stdout}));
+        }
+    }
+
+    // Fallback reqwest
     let resp = match client
         .post(&url)
-        .header(AUTHORIZATION, format!("Bearer {token}"))
-        .header(REFERER, format!("https://kick.com/{streamer}/"))
+        .header(AUTHORIZATION, &auth_str)
+        .header(REFERER, &ref_hdr)
         .header(CONTENT_TYPE, "application/json")
         .json(&payload)
         .send()
