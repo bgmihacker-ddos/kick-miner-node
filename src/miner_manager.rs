@@ -31,23 +31,32 @@ pub async fn run_miner_loop(config: AppConfig, state: SharedState) {
         config.Accounts.len()
     );
 
-    // Initial immediate balance fetch for all accounts on boot
-    info!("Performing initial points balance fetch for all accounts...");
-    for acc in &config.Accounts {
-        let acc_client = account_clients
-            .get(&acc.alias)
-            .cloned()
-            .unwrap_or_else(|| global_client.clone());
+    // Initial immediate balance fetch for all accounts in background so watchers can start immediately
+    let bg_accounts = config.Accounts.clone();
+    let bg_account_clients = account_clients.clone();
+    let bg_global_client = global_client.clone();
+    let bg_state = Arc::clone(&state);
 
-        for streamer in &acc.streamers {
-            if let Some(pts) = get_live_points(&acc_client, streamer, &acc.token).await {
-                let mut s = state.write().await;
-                s.set_points(&acc.alias, streamer, pts);
+    tokio::spawn(async move {
+        info!("Background points balance fetcher started for all accounts...");
+        for acc in &bg_accounts {
+            let acc_client = bg_account_clients
+                .get(&acc.alias)
+                .cloned()
+                .unwrap_or_else(|| bg_global_client.clone());
+
+            for streamer in &acc.streamers {
+                if let Some(pts) =
+                    get_live_points(&acc_client, streamer, &acc.token, acc.proxy.as_deref()).await
+                {
+                    let mut s = bg_state.write().await;
+                    s.set_points(&acc.alias, streamer, pts);
+                }
+                sleep(Duration::from_millis(50)).await;
             }
-            sleep(Duration::from_millis(50)).await;
         }
-    }
-    info!("Initial points balance fetch complete!");
+        info!("Background initial points balance fetch complete!");
+    });
 
     loop {
         cycle_count += 1;
@@ -56,8 +65,13 @@ pub async fn run_miner_loop(config: AppConfig, state: SharedState) {
         // 1. Check online status for all streamers (using primary account token to avoid Cloudflare 403)
         let mut live_streamers: HashMap<String, (u64, u64, u64)> = HashMap::new(); // streamer -> (channel_id, user_id, stream_id)
         for streamer in &config.Streamers {
-            if let Some(details) =
-                get_channel_info(&global_client, streamer, primary_token.as_deref()).await
+            if let Some(details) = get_channel_info(
+                &global_client,
+                streamer,
+                primary_token.as_deref(),
+                None,
+            )
+            .await
             {
                 {
                     let mut s = state.write().await;
@@ -78,7 +92,7 @@ pub async fn run_miner_loop(config: AppConfig, state: SharedState) {
                 }
             }
             // slight stagger between streamer checks
-            sleep(Duration::from_millis(150)).await;
+            sleep(Duration::from_millis(100)).await;
         }
 
         if !live_streamers.is_empty() {
@@ -124,8 +138,15 @@ pub async fn run_miner_loop(config: AppConfig, state: SharedState) {
 
                 if let Some(&(channel_id, user_id, livestream_id)) = live_streamers.get(streamer) {
                     debug!("[{}] Acquiring WS token for live streamer {}", acc.alias, streamer);
-                    if let Some(ws_token) =
-                        get_ws_token(&acc_client, streamer, channel_id, user_id, &acc.token).await
+                    if let Some(ws_token) = get_ws_token(
+                        &acc_client,
+                        streamer,
+                        channel_id,
+                        user_id,
+                        &acc.token,
+                        acc.proxy.as_deref(),
+                    )
+                    .await
                     {
                         let (stop_tx, stop_rx) = watch::channel(false);
                         active_watchers.insert(key, stop_tx);
@@ -151,14 +172,22 @@ pub async fn run_miner_loop(config: AppConfig, state: SharedState) {
                 }
             }
 
-            // 4. Update points periodically (every 2 cycles)
+            // 4. Update points periodically for live streamers (priority every 2 cycles)
             if cycle_count % 2 == 0 {
-                for streamer in &acc.streamers {
-                    if let Some(pts) = get_live_points(&acc_client, streamer, &acc.token).await {
-                        let mut s = state.write().await;
-                        s.set_points(&acc.alias, streamer, pts);
+                for (live_s, _) in &live_streamers {
+                    if acc.streamers.contains(live_s) {
+                        if let Some(pts) = get_live_points(
+                            &acc_client,
+                            live_s,
+                            &acc.token,
+                            acc.proxy.as_deref(),
+                        )
+                        .await
+                        {
+                            let mut s = state.write().await;
+                            s.set_points(&acc.alias, live_s, pts);
+                        }
                     }
-                    sleep(Duration::from_millis(50)).await;
                 }
             }
         }
