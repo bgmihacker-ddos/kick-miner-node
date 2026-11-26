@@ -173,25 +173,30 @@ pub async fn get_channel_info(
         }
     }
 
-    let raw_val: Option<Value> = if let Ok(stdout) = exec_impersonate("GET", &url, &hdrs, None, proxy).await {
-        serde_json::from_str::<Value>(&stdout).ok()
-    } else {
-        // Fallback to reqwest
-        let mut req = client.get(&url).header(REFERER, &ref_hdr);
-        if let Some(tok) = auth_token {
-            if !tok.is_empty() {
-                req = req.header(AUTHORIZATION, format!("Bearer {tok}"));
-            }
+    let raw_val: Option<Value> = match exec_impersonate("GET", &url, &hdrs, None, proxy).await {
+        Ok(stdout) => serde_json::from_str::<Value>(&stdout).ok(),
+        Err(err_msg) if err_msg.starts_with("HTTP ") => {
+            debug!("Channel API [{streamer}] {err_msg}");
+            None
         }
-        if let Ok(resp) = req.send().await {
-            if resp.status().is_success() {
-                resp.json().await.ok()
+        Err(_) => {
+            // Fallback to reqwest only when curl_chrome116 fails to launch
+            let mut req = client.get(&url).header(REFERER, &ref_hdr);
+            if let Some(tok) = auth_token {
+                if !tok.is_empty() {
+                    req = req.header(AUTHORIZATION, format!("Bearer {tok}"));
+                }
+            }
+            if let Ok(resp) = req.send().await {
+                if resp.status().is_success() {
+                    resp.json().await.ok()
+                } else {
+                    debug!("Channel API [{streamer}] HTTP status: {}", resp.status());
+                    None
+                }
             } else {
-                debug!("Channel API [{streamer}] HTTP status: {}", resp.status());
                 None
             }
-        } else {
-            None
         }
     };
 
@@ -252,25 +257,30 @@ pub async fn get_ws_token(
         ("x-requested-with", "XMLHttpRequest"),
     ];
 
-    let raw_val: Option<Value> = if let Ok(stdout) = exec_impersonate("GET", url, &hdrs, None, proxy).await {
-        serde_json::from_str::<Value>(&stdout).ok()
-    } else {
-        let resp = client
-            .get(url)
-            .header(REFERER, &ref_hdr)
-            .header(ORIGIN, "https://kick.com")
-            .header("x-client-token", "e1393935a959b4020a4491574f6490129f678acdaa92760471263db43487f823")
-            .header("x-requested-with", "XMLHttpRequest")
-            .header(AUTHORIZATION, &auth_str)
-            .header(CONTENT_TYPE, "application/json")
-            .send()
-            .await
-            .ok()?;
-        if resp.status().is_success() {
-            resp.json().await.ok()
-        } else {
-            warn!("Failed to fetch WS token for {streamer}: HTTP {}", resp.status());
+    let raw_val: Option<Value> = match exec_impersonate("GET", url, &hdrs, None, proxy).await {
+        Ok(stdout) => serde_json::from_str::<Value>(&stdout).ok(),
+        Err(err_msg) if err_msg.starts_with("HTTP ") => {
+            warn!("Failed to fetch WS token for {streamer}: {err_msg}");
             None
+        }
+        Err(_) => {
+            let resp = client
+                .get(url)
+                .header(REFERER, &ref_hdr)
+                .header(ORIGIN, "https://kick.com")
+                .header("x-client-token", "e1393935a959b4020a4491574f6490129f678acdaa92760471263db43487f823")
+                .header("x-requested-with", "XMLHttpRequest")
+                .header(AUTHORIZATION, &auth_str)
+                .header(CONTENT_TYPE, "application/json")
+                .send()
+                .await
+                .ok()?;
+            if resp.status().is_success() {
+                resp.json().await.ok()
+            } else {
+                warn!("Failed to fetch WS token for {streamer}: HTTP {}", resp.status());
+                None
+            }
         }
     };
 
@@ -301,16 +311,23 @@ pub async fn get_live_points(
         ("Authorization", &auth_str),
     ];
 
-    if let Ok(stdout) = exec_impersonate("GET", &url, &hdrs, None, proxy).await {
-        if let Ok(val) = serde_json::from_str::<Value>(&stdout) {
-            let pts = val
-                .pointer("/data/points")
-                .or_else(|| val.get("points"))
-                .and_then(|v| v.as_u64());
-            if let Some(p) = pts {
-                return Some(p);
+    match exec_impersonate("GET", &url, &hdrs, None, proxy).await {
+        Ok(stdout) => {
+            if let Ok(val) = serde_json::from_str::<Value>(&stdout) {
+                let pts = val
+                    .pointer("/data/points")
+                    .or_else(|| val.get("points"))
+                    .and_then(|v| v.as_u64());
+                if let Some(p) = pts {
+                    return Some(p);
+                }
             }
+            return None;
         }
+        Err(err_msg) if err_msg.starts_with("HTTP ") => {
+            return None;
+        }
+        Err(_) => {}
     }
 
     // Fallback reqwest
