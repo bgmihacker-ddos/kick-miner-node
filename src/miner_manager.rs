@@ -52,7 +52,7 @@ pub async fn run_miner_loop(config: AppConfig, state: SharedState) {
                     let mut s = bg_state.write().await;
                     s.set_points(&acc.alias, streamer, pts);
                 }
-                sleep(Duration::from_millis(50)).await;
+                sleep(Duration::from_millis(120)).await;
             }
         }
         info!("Background initial points balance fetch complete!");
@@ -114,66 +114,78 @@ pub async fn run_miner_loop(config: AppConfig, state: SharedState) {
             }
         });
 
-        // 3. For each account, launch watchers up to max_concurrent
+        // 3. For each account, launch watchers up to max_concurrent (staggered to avoid Kick 429)
+        let mut ws_fail_streak = 0u32;
         for acc in &config.Accounts {
-            let acc_client = account_clients
-                .get(&acc.alias)
-                .cloned()
-                .unwrap_or_else(|| global_client.clone());
+            if ws_fail_streak < 2 {
+                let acc_client = account_clients
+                    .get(&acc.alias)
+                    .cloned()
+                    .unwrap_or_else(|| global_client.clone());
 
-            let mut current_watching_count = active_watchers
-                .keys()
-                .filter(|(alias, _)| alias == &acc.alias)
-                .count();
+                let mut current_watching_count = active_watchers
+                    .keys()
+                    .filter(|(alias, _)| alias == &acc.alias)
+                    .count();
 
-            for streamer in &acc.streamers {
-                if current_watching_count >= acc.max_concurrent {
-                    break;
-                }
+                for streamer in &acc.streamers {
+                    if current_watching_count >= acc.max_concurrent || ws_fail_streak >= 2 {
+                        break;
+                    }
 
-                let key = (acc.alias.clone(), streamer.clone());
-                if active_watchers.contains_key(&key) {
-                    continue;
-                }
+                    let key = (acc.alias.clone(), streamer.clone());
+                    if active_watchers.contains_key(&key) {
+                        continue;
+                    }
 
-                if let Some(&(channel_id, user_id, livestream_id)) = live_streamers.get(streamer) {
-                    debug!("[{}] Acquiring WS token for live streamer {}", acc.alias, streamer);
-                    if let Some(ws_token) = get_ws_token(
-                        &acc_client,
-                        streamer,
-                        channel_id,
-                        user_id,
-                        &acc.token,
-                        acc.proxy.as_deref(),
-                    )
-                    .await
-                    {
-                        let (stop_tx, stop_rx) = watch::channel(false);
-                        active_watchers.insert(key, stop_tx);
-                        current_watching_count += 1;
+                    if let Some(&(channel_id, user_id, livestream_id)) = live_streamers.get(streamer) {
+                        debug!("[{}] Acquiring WS token for live streamer {}", acc.alias, streamer);
+                        if let Some(ws_token) = get_ws_token(
+                            &acc_client,
+                            streamer,
+                            channel_id,
+                            user_id,
+                            &acc.token,
+                            acc.proxy.as_deref(),
+                        )
+                        .await
+                        {
+                            ws_fail_streak = 0;
+                            let (stop_tx, stop_rx) = watch::channel(false);
+                            active_watchers.insert(key, stop_tx);
+                            current_watching_count += 1;
 
-                        let a_alias = acc.alias.clone();
-                        let s_name = streamer.clone();
-                        let shared = Arc::clone(&state);
+                            let a_alias = acc.alias.clone();
+                            let s_name = streamer.clone();
+                            let shared = Arc::clone(&state);
 
-                        tokio::spawn(async move {
-                            run_ws_watcher(
-                                a_alias,
-                                s_name,
-                                channel_id,
-                                livestream_id,
-                                ws_token,
-                                shared,
-                                stop_rx,
-                            )
-                            .await;
-                        });
+                            tokio::spawn(async move {
+                                run_ws_watcher(
+                                    a_alias,
+                                    s_name,
+                                    channel_id,
+                                    livestream_id,
+                                    ws_token,
+                                    shared,
+                                    stop_rx,
+                                )
+                                .await;
+                            });
+                            sleep(Duration::from_millis(450)).await;
+                        } else {
+                            ws_fail_streak += 1;
+                            sleep(Duration::from_millis(1200)).await;
+                        }
                     }
                 }
             }
 
             // 4. Update points periodically for live streamers (priority every 2 cycles)
             if cycle_count % 2 == 0 {
+                let acc_client = account_clients
+                    .get(&acc.alias)
+                    .cloned()
+                    .unwrap_or_else(|| global_client.clone());
                 for (live_s, _) in &live_streamers {
                     if acc.streamers.contains(live_s) {
                         if let Some(pts) = get_live_points(
