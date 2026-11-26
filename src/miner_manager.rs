@@ -2,7 +2,7 @@ use crate::config::AppConfig;
 use crate::kick_api::{build_http_client, get_channel_info, get_live_points, get_ws_token};
 use crate::state::SharedState;
 use crate::ws_watcher::run_ws_watcher;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -38,7 +38,10 @@ pub async fn run_miner_loop(config: AppConfig, state: SharedState) {
     let bg_state = Arc::clone(&state);
 
     tokio::spawn(async move {
-        info!("Background points balance fetcher started for all accounts...");
+        // Let main loop detect live streamers and connect WS viewers FIRST with zero WAF pressure
+        sleep(Duration::from_secs(20)).await;
+        info!("Background points balance fetcher started gently for all accounts...");
+        let mut fail_streak = 0u32;
         for acc in &bg_accounts {
             let acc_client = bg_account_clients
                 .get(&acc.alias)
@@ -49,10 +52,16 @@ pub async fn run_miner_loop(config: AppConfig, state: SharedState) {
                 if let Some(pts) =
                     get_live_points(&acc_client, streamer, &acc.token, acc.proxy.as_deref()).await
                 {
+                    fail_streak = 0;
                     let mut s = bg_state.write().await;
                     s.set_points(&acc.alias, streamer, pts);
+                    sleep(Duration::from_millis(650)).await;
+                } else {
+                    fail_streak += 1;
+                    // Exponential backoff if Kick WAF throttles
+                    let backoff_ms = if fail_streak >= 3 { 8000 } else { 1500 };
+                    sleep(Duration::from_millis(backoff_ms)).await;
                 }
-                sleep(Duration::from_millis(120)).await;
             }
         }
         info!("Background initial points balance fetch complete!");
@@ -64,6 +73,7 @@ pub async fn run_miner_loop(config: AppConfig, state: SharedState) {
 
         // 1. Check online status for all streamers (using primary account token to avoid Cloudflare 403)
         let mut live_streamers: HashMap<String, (u64, u64, u64)> = HashMap::new(); // streamer -> (channel_id, user_id, stream_id)
+        let mut confirmed_offline: HashSet<String> = HashSet::new();
         for streamer in &config.Streamers {
             if let Some(details) = get_channel_info(
                 &global_client,
@@ -89,10 +99,12 @@ pub async fn run_miner_loop(config: AppConfig, state: SharedState) {
                             (details.channel_id, details.user_id, ls_id),
                         );
                     }
+                } else {
+                    confirmed_offline.insert(streamer.clone());
                 }
             }
-            // slight stagger between streamer checks
-            sleep(Duration::from_millis(100)).await;
+            // stagger between streamer checks to avoid WAF rate limit
+            sleep(Duration::from_millis(250)).await;
         }
 
         if !live_streamers.is_empty() {
@@ -103,9 +115,9 @@ pub async fn run_miner_loop(config: AppConfig, state: SharedState) {
             );
         }
 
-        // 2. Stop watchers for streamers that are no longer live
+        // 2. Only stop watchers if Kick CONFIRMED the streamer went offline (never drop on transient 429)
         active_watchers.retain(|(alias, streamer), stop_tx| {
-            if !live_streamers.contains_key(streamer) {
+            if confirmed_offline.contains(streamer) {
                 info!("[{alias}] Streamer {streamer} went offline; stopping watcher");
                 let _ = stop_tx.send(true);
                 false
@@ -180,8 +192,8 @@ pub async fn run_miner_loop(config: AppConfig, state: SharedState) {
                 }
             }
 
-            // 4. Update points periodically for live streamers (priority every 2 cycles)
-            if cycle_count % 2 == 0 {
+            // 4. Update points periodically for live streamers (every 4 cycles with gentle stagger)
+            if cycle_count % 4 == 0 {
                 let acc_client = account_clients
                     .get(&acc.alias)
                     .cloned()
@@ -199,6 +211,7 @@ pub async fn run_miner_loop(config: AppConfig, state: SharedState) {
                             let mut s = state.write().await;
                             s.set_points(&acc.alias, live_s, pts);
                         }
+                        sleep(Duration::from_millis(250)).await;
                     }
                 }
             }
