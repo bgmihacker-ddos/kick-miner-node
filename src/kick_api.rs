@@ -103,7 +103,12 @@ pub async fn exec_impersonate(
     };
 
     let mut cmd = tokio::process::Command::new(bin);
-    cmd.arg("-s").arg("-S").arg("--max-time").arg("12");
+    cmd.arg("-s")
+        .arg("-S")
+        .arg("--max-time")
+        .arg("12")
+        .arg("-w")
+        .arg("\n%{http_code}");
 
     if method == "POST" {
         cmd.arg("-X").arg("POST");
@@ -130,13 +135,22 @@ pub async fn exec_impersonate(
         .await
         .map_err(|e| format!("exec error: {e}"))?;
 
-    let stdout_str = String::from_utf8_lossy(&output.stdout).to_string();
-    if output.status.success() {
-        Ok(stdout_str)
-    } else {
+    let raw_stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    if !output.status.success() {
         let stderr_str = String::from_utf8_lossy(&output.stderr).to_string();
-        Err(format!("curl error: {stderr_str} | stdout: {stdout_str}"))
+        return Err(format!("curl error: {stderr_str} | stdout: {raw_stdout}"));
     }
+
+    if let Some((body_part, code_part)) = raw_stdout.trim_end().rsplit_once('\n') {
+        if let Ok(status_code) = code_part.trim().parse::<u16>() {
+            if status_code >= 400 {
+                return Err(format!("HTTP {status_code}: {body_part}"));
+            }
+            return Ok(body_part.to_string());
+        }
+    }
+
+    Ok(raw_stdout)
 }
 
 pub async fn get_channel_info(
@@ -345,12 +359,19 @@ pub async fn vote_prediction(
     });
     let payload_str = payload.to_string();
 
-    if let Ok(stdout) = exec_impersonate("POST", &url, &hdrs, Some(&payload_str), proxy).await {
-        if let Ok(v) = serde_json::from_str::<Value>(&stdout) {
-            return Ok(v);
-        } else {
-            return Ok(serde_json::json!({"status": "ok", "raw": stdout}));
+    match exec_impersonate("POST", &url, &hdrs, Some(&payload_str), proxy).await {
+        Ok(stdout) => {
+            if let Ok(v) = serde_json::from_str::<Value>(&stdout) {
+                return Ok(v);
+            } else {
+                return Ok(serde_json::json!({"status": "ok", "raw": stdout}));
+            }
         }
+        Err(err_msg) if err_msg.starts_with("HTTP ") => {
+            error!("Vote prediction rejected for {streamer}: {err_msg}");
+            return Err(err_msg);
+        }
+        Err(_) => {}
     }
 
     // Fallback reqwest
